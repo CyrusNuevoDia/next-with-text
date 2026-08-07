@@ -36,12 +36,32 @@ Every surface is asserted by a test suite that builds a real Next app — file-l
 
 ## Auth safety, by construction
 
-Pages behind auth never leak into the static output — the generation mechanism can't publish them:
+By default, pages behind auth never leak into the static output — the generation mechanism can't publish them. Listing one is possible, but only as [a deliberate opt-in](#listing-a-gated-page-on-purpose) written into the page itself.
 
 - The static surfaces (`llms.txt`, `llms-full.txt`, the `.md` files) are generated **only from HTML that `next build` prerendered**. An auth-gated page reads `cookies()` or `headers()`, or redirects — so Next marks it dynamic and emits no build HTML for it. There's nothing to publish, so nothing leaks; there is no exclude list to forget.
 - Routes guarded by your `proxy.ts` (middleware) are excluded too, even when they're statically prerenderable: `withText` reads the compiled matchers from the build output and drops every matching route from all static surfaces. Also automatic — a `matcher: ["/admin/:path*"]` means no `/admin` in either index and no published `admin.md`.
 
-Auth-gated dynamic pages still get `.md` and Accept negotiation, safely: they're converted on demand by fetching the page with **the requester's own cookies**, so `/account.md` renders exactly what `/account` would show that visitor.
+Auth-gated dynamic pages still get `.md` and Accept negotiation, safely: they're converted on demand by fetching the page with **the requester's own cookies**, so `/account.md` renders exactly what `/account` would show that visitor. Those responses are sent `Cache-Control: private, no-store`, so a CDN that caches without varying on `Cookie` can't hand one visitor's page to the next.
+
+### Listing a gated page on purpose
+
+Sometimes you want an agent to know a page exists — an account area, a guarded reports section — without publishing what's behind it. A page opts in by exporting `md` with a title and no content:
+
+```tsx
+// app/account/page.tsx
+export const md = {
+  title: "Your account",
+  description: "Billing, plan, and settings. Requires sign-in.",
+};
+```
+
+That entry appears in `llms.txt`; `llms-full.txt` carries the same metadata plus a `[Requires session]` link instead of a body; no `account.md` file is written, so `/account.md` keeps rendering live with the caller's cookies. Add a `content` alongside the title and that text becomes the published body — useful for a guarded page you want to describe properly.
+
+The safety property is unchanged, because the opt-in is an allowlist and everything it publishes is text you wrote in the page file — the page's rendering is never the source. Three things hold it in place:
+
+- **Only literal routes.** `/users/[id]` can't opt in: there are no concrete URLs to publish without enumerating your customers.
+- **`exclude` still wins.** A route matched by an `exclude` pattern stays dark no matter what it exports, so config remains a reliable kill switch.
+- **It's never quiet.** Every build prints the routes that opted in by name: `2 gated route(s) opted into the index via md export: /admin/reports, /gated`.
 
 ## Options
 
@@ -54,6 +74,7 @@ export default withText(nextConfig, {
   exclude: [], // excluded routes vanish from every surface: both indexes,
   // no .md file, and the on-demand route 404s them
   llmstxt: (ctx) => "…", // optional: its return value IS the entire llms.txt body
+  // ctx is { title, description, sections: [{ title, routes: [{ title, description, href }] }] }
 });
 ```
 
@@ -103,19 +124,21 @@ Functions also receive `searchParams` — real values during on-demand conversio
 If the default template isn't right, take over the whole file:
 
 ```ts
-llmstxt: ({ title, description, routes }) =>
+llmstxt: ({ title, description, sections }) =>
   [
     `# ${title}`,
     `> ${description}`,
-    "",
-    "## Docs",
-    ...routes
-      .filter((r) => r.href.startsWith("/docs"))
-      .map((r) => `- [${r.title}](${r.href}): ${r.description}`),
-  ].join("\n");
+    ...sections.flatMap((section) => [
+      "",
+      section.title && `## ${section.title}`,
+      ...section.routes.map((r) => `- [${r.title}](${r.href}): ${r.description}`),
+    ]),
+  ]
+    .filter(Boolean)
+    .join("\n");
 ```
 
-`routes` is the final route list — filtered, auth-excluded, with any `md` overrides applied. This only affects `llms.txt`; `llms-full.txt` has no knobs.
+`sections` is the final route list, grouped the way the default index groups it — filtered, auth-excluded, with any `md` overrides applied. The first section has an empty `title`: those are the root-level pages the index opens with, before any heading. A section is only present when it has routes, so you never have to guard against empty ones. Regroup them however you like; this only affects `llms.txt`, and `llms-full.txt` has no knobs.
 
 ## Generated files clean up after themselves
 

@@ -3,28 +3,33 @@ import { join } from "node:path"
 import { convert } from "@xberg-io/html-to-markdown"
 import {
   CONVERT_OPTIONS,
+  compareCodeUnits,
   discoverBuiltRoutes,
   evaluateMd,
+  isPageFile,
   type Link,
   matchesRoute,
   matchPattern,
   orderLinks,
   type PageMeta,
   pageMeta,
+  publishedBody,
   type ResolvedMd,
   type RouteOptions,
   readProxyMatchers,
   renderFull,
   renderIndex,
+  renderStub,
   stripFrontmatter,
 } from "./shared"
 
-interface RouteContext {
+type RouteContext = {
   params: Promise<{ path: string[] }>
 }
 type Loaders = Record<string, () => Promise<unknown>>
-interface ServedPage {
-  content: string
+type ServedPage = {
+  // null when the page publishes no body — llms-full.txt carries a stub
+  content: string | null
   meta: PageMeta
   rendered: PageMeta
   route: string
@@ -42,7 +47,7 @@ export function createHandler(options: RouteOptions, loaders: Loaders = {}) {
     ctx: RouteContext
   ): Promise<Response> {
     const { path } = await ctx.params
-    const target = (path ?? []).join("/")
+    const target = path.join("/")
     const origin = requestOrigin(req)
 
     if (target === "llms.txt" || target === "llms-full.txt") {
@@ -52,52 +57,108 @@ export function createHandler(options: RouteOptions, loaders: Loaders = {}) {
     if (!(target.endsWith(".md") && options.md)) {
       return notFound()
     }
-    const route = `/${target.replace(/\.md$/, "").replace(/^index$/, "")}`
+    const markdownTarget = target.slice(0, -".md".length)
+    const route = markdownTarget === "index" ? "/" : `/${markdownTarget}`
     if (!matchesRoute(route, options)) {
       return notFound()
     }
 
     const override = await evaluateOverride(loaders, route, searchParamsOf(req))
-    if (override) {
+    if (override?.content !== undefined) {
       return respond(override.content, "text/markdown")
     }
 
-    const html = await fetchPage(origin, route, req.headers.get("cookie"))
+    // A titled export declaring no content leaves the body to the live page, so
+    // the fetch carries the caller's own cookies and renders their own view —
+    // the reason a gated route can be listed and still answer honestly.
+    const cookie = req.headers.get("cookie")
+    const html = await fetchPage(origin, route, cookie)
     if (html === null) {
-      return notFound()
+      return override?.title === undefined
+        ? notFound()
+        : respond(stubFor(route, override, options.md), "text/markdown")
     }
     return respond(
       convert(html, CONVERT_OPTIONS).content ?? "",
-      "text/markdown"
+      "text/markdown",
+      cookie !== null
     )
   }
 }
 
+// An opted-in route that the caller can't render (no session, or an auth guard
+// turned them away) still answers with what the page declared about itself.
+function stubFor(
+  route: string,
+  override: ResolvedMd,
+  mdEnabled: boolean
+): string {
+  return renderStub(
+    {
+      description: override.description ?? "",
+      route,
+      title: override.title ?? "",
+    },
+    mdEnabled
+  )
+}
+
 // Static patterns win over dynamic ones ("/tags/list" beats "/tags/[tag]").
-async function evaluateOverride(
+function evaluateOverride(
   loaders: Loaders,
   route: string,
   searchParams: Record<string, string | string[]>
 ): Promise<ResolvedMd | null> {
-  const patterns = Object.keys(loaders).sort(
-    (a, b) => Number(a.includes("[")) - Number(b.includes("["))
-  )
-  for (const pattern of patterns) {
+  const patterns = Object.keys(loaders).sort(comparePatterns)
+  return evaluateCandidate(patterns, 0)
+
+  async function evaluateCandidate(
+    candidates: string[],
+    index: number
+  ): Promise<ResolvedMd | null> {
+    const pattern = candidates[index]
+    if (pattern === undefined) {
+      return null
+    }
     const params = matchPattern(route, pattern)
-    if (!params) {
-      continue
-    }
-    try {
-      const mod = (await loaders[pattern]()) as { md?: unknown }
-      const value = await evaluateMd(mod.md, params, searchParams)
-      if (value) {
-        return value
+    if (params) {
+      try {
+        const mod = (await loaders[pattern]()) as { md?: unknown }
+        const value = await evaluateMd(mod.md, params, searchParams)
+        if (value) {
+          return value
+        }
+      } catch {
+        // a page module that fails to load falls back to HTML conversion
       }
-    } catch {
-      // a page module that fails to load falls back to HTML conversion
     }
+    return evaluateCandidate(candidates, index + 1)
   }
-  return null
+}
+
+async function optedInRoutes(
+  loaders: Loaders,
+  discovered: string[],
+  options: RouteOptions
+): Promise<string[]> {
+  const candidates = Object.keys(loaders).filter(
+    (pattern) =>
+      !(pattern.includes("[") || discovered.includes(pattern)) &&
+      matchesRoute(pattern, options)
+  )
+  const titled = await Promise.all(
+    candidates.map(async (pattern) =>
+      (await evaluateOverride(loaders, pattern, {}))?.title === undefined
+        ? null
+        : pattern
+    )
+  )
+  return titled.filter((pattern): pattern is string => pattern !== null)
+}
+
+function comparePatterns(a: string, b: string): number {
+  const dynamicOrder = Number(a.includes("[")) - Number(b.includes("["))
+  return dynamicOrder || compareCodeUnits(a, b)
 }
 
 async function serveSurface(
@@ -106,30 +167,54 @@ async function serveSurface(
   options: RouteOptions,
   loaders: Loaders
 ): Promise<Response> {
-  const routes = discoverRoutes(options.dev).filter((route) =>
+  const discovered = discoverRoutes(options.dev).filter((route) =>
     matchesRoute(route, options)
   )
-  // unauthenticated fetches: pages that redirect or fail (auth guards) drop out
+  // Gated routes are missing from that list by construction — nothing
+  // prerendered, or a proxy matcher covers them. A literal-path page exporting
+  // a titled md is opting in, so add it back; dynamic patterns never can,
+  // having no concrete URL to publish.
+  const optIn = await optedInRoutes(loaders, discovered, options)
+
   const pages = (
     await Promise.all(
-      routes.map(async (route): Promise<ServedPage | null> => {
-        const html = await fetchPage(origin, route, null)
-        if (html === null) {
-          return null
+      [...discovered, ...optIn].map(
+        async (route): Promise<ServedPage | null> => {
+          const override = await evaluateOverride(loaders, route, {})
+          const declared: ServedPage | null =
+            override?.title === undefined
+              ? null
+              : {
+                  content: override.content ?? null,
+                  meta: {
+                    description: override.description ?? "",
+                    title: override.title,
+                  },
+                  rendered: { description: "", title: "" },
+                  route,
+                }
+          if (!discovered.includes(route)) {
+            return declared
+          }
+          // unauthenticated fetch: a page an auth guard turns away publishes
+          // only what it declared, and drops out entirely if it declared nothing
+          const html = await fetchPage(origin, route, null)
+          if (html === null) {
+            return declared
+          }
+          const result = convert(html, CONVERT_OPTIONS)
+          const rendered = pageMeta(result.metadata)
+          return {
+            content: publishedBody(override, result.content),
+            meta: {
+              description: override?.description ?? rendered.description,
+              title: override?.title ?? rendered.title,
+            },
+            rendered,
+            route,
+          }
         }
-        const result = convert(html, CONVERT_OPTIONS)
-        const rendered = pageMeta(result.metadata)
-        const override = await evaluateOverride(loaders, route, {})
-        return {
-          content: override?.content ?? result.content ?? "",
-          meta: {
-            description: override?.description ?? rendered.description,
-            title: override?.title ?? rendered.title,
-          },
-          rendered,
-          route,
-        }
-      })
+      )
     )
   ).filter((page): page is ServedPage => page !== null)
 
@@ -142,9 +227,12 @@ async function serveSurface(
     return respond(renderIndex(site, links, options.md), "text/plain")
   }
   const byRoute = new Map(pages.map((page) => [page.route, page]))
-  const sections = orderLinks(links).map((link) =>
-    stripFrontmatter(byRoute.get(link.route)?.content ?? "").trim()
-  )
+  const sections = orderLinks(links).map((link) => {
+    const content = byRoute.get(link.route)?.content
+    return content === null || content === undefined
+      ? renderStub(link, options.md)
+      : stripFrontmatter(content).trim()
+  })
   return respond(renderFull(site, sections), "text/plain")
 }
 
@@ -166,32 +254,24 @@ function discoverRoutes(dev: boolean): string[] {
 function walkAppRoutes(dir: string): string[] {
   const srcApp = join(dir, "src/app")
   const plainApp = join(dir, "app")
-  const appDir = existsSync(srcApp)
-    ? srcApp
-    : existsSync(plainApp)
-      ? plainApp
-      : null
+  const appDir = resolveAppDirectory(srcApp, plainApp)
   if (!appDir) {
     return []
   }
   const routes: string[] = []
   walk(appDir, "")
-  return routes.sort()
+  return routes.sort(compareCodeUnits)
 
   function walk(current: string, route: string): void {
     const entries = readdirSync(current, { withFileTypes: true })
-    if (
-      entries.some(
-        (e) => e.isFile() && /^page\.(tsx|jsx|ts|js|mdx)$/.test(e.name)
-      )
-    ) {
+    if (entries.some((entry) => entry.isFile() && isPageFile(entry.name))) {
       routes.push(route === "" ? "/" : route)
     }
     for (const entry of entries) {
       if (!entry.isDirectory()) {
         continue
       }
-      const name = entry.name
+      const { name } = entry
       if (
         name.startsWith("_") ||
         name.startsWith("%5F") ||
@@ -206,6 +286,13 @@ function walkAppRoutes(dir: string): string[] {
       )
     }
   }
+}
+
+function resolveAppDirectory(srcApp: string, plainApp: string): string | null {
+  if (existsSync(srcApp)) {
+    return srcApp
+  }
+  return existsSync(plainApp) ? plainApp : null
 }
 
 async function siteMeta(
@@ -245,7 +332,7 @@ async function fetchPage(
 }
 
 function searchParamsOf(req: Request): Record<string, string | string[]> {
-  const searchParams = new URL(req.url).searchParams
+  const { searchParams } = new URL(req.url)
   const result: Record<string, string | string[]> = {}
   for (const key of searchParams.keys()) {
     const values = searchParams.getAll(key)
@@ -263,10 +350,20 @@ function requestOrigin(req: Request): string {
   return `${proto}://${host}`
 }
 
-function respond(body: string, type: "text/markdown" | "text/plain"): Response {
-  return new Response(body, {
-    headers: { "content-type": `${type}; charset=utf-8` },
-  })
+// A body rendered from the caller's cookies is theirs alone: mark it private so
+// a CDN that caches without varying on Cookie can't hand it to the next visitor.
+function respond(
+  body: string,
+  type: "text/markdown" | "text/plain",
+  personalized = false
+): Response {
+  const headers: Record<string, string> = {
+    "content-type": `${type}; charset=utf-8`,
+  }
+  if (personalized) {
+    headers["cache-control"] = "private, no-store"
+  }
+  return new Response(body, { headers })
 }
 
 function notFound(): Response {

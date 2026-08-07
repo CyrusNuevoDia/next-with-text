@@ -1,8 +1,8 @@
 import type { Metadata } from "next"
 
 export const metadata: Metadata = {
-  title: "Zebra",
   description: "Alphabetically after llms-full.txt — ordering probe.",
+  title: "Zebra",
 }
 
 export default async function Zebra() {

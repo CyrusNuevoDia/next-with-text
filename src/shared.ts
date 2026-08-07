@@ -1,10 +1,18 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs"
 import { join, relative, sep } from "node:path"
+import type { HtmlMetadata } from "@xberg-io/html-to-markdown"
 import multimatch from "multimatch"
 
+const WORD_SEPARATOR = /[-_]/
+
+// The md export is the page's entire published text. A `content` publishes a
+// body; a `title` with no `content` is the listing opt-in — publish this entry,
+// never this page's body — which is what lets an auth-gated route appear in
+// llms.txt without anything rendered from a session reaching a static file.
 export type MarkdownContent =
   | string
-  | { title: string; description: string; content: string }
+  | { content: string; description?: string; title?: string }
+  | { content?: string; description?: string; title: string }
 
 // Params derived structurally from the route string literal, mirroring what
 // Next's generated PageProps helper produces for the same route. PageProps
@@ -17,12 +25,12 @@ type RouteParams<Route extends string> =
       ? { [K in Param]: string[] } & RouteParams<Rest>
       : Route extends `${string}[${infer Param}]${infer Rest}`
         ? { [K in Param]: string } & RouteParams<Rest>
-        : {}
+        : Record<never, never>
 
 // Mirrors Next's generated PageProps helper shape-for-shape; exported so the
 // function-declaration style works too:
 // `export async function md({ params }: MarkdownProps<'/tags/[tag]'>) { … }`
-export interface MarkdownProps<Route extends string = string> {
+export type MarkdownProps<Route extends string = string> = {
   params: Promise<
     string extends Route
       ? Record<string, string | string[] | undefined>
@@ -37,13 +45,26 @@ export type MarkdownPage<Route extends string = string> =
       props: MarkdownProps<Route>
     ) => MarkdownContent | Promise<MarkdownContent>)
 
-export interface LlmstxtContext {
+export type LlmstxtLink = {
   description: string
-  routes: { title: string; description: string; href: string }[]
+  href: string
   title: string
 }
 
-export interface WithTextOptions {
+// A section with no title is the unheaded block the index opens with; the
+// default renderer draws "## <title>" for the rest.
+export type LlmstxtSection = {
+  routes: LlmstxtLink[]
+  title: string
+}
+
+export type LlmstxtContext = {
+  description: string
+  sections: LlmstxtSection[]
+  title: string
+}
+
+export type WithTextOptions = {
   exclude?: string[]
   include?: string[]
   llmstxt?: (ctx: LlmstxtContext) => string
@@ -52,7 +73,7 @@ export interface WithTextOptions {
 
 // The serializable subset — it crosses into the codegen'd route and the
 // build-exit child as JSON. The llmstxt function travels separately.
-export interface ResolvedOptions {
+export type ResolvedOptions = {
   exclude: string[]
   include: string[]
   md: boolean
@@ -87,32 +108,29 @@ export function matchesRoute(
 }
 
 function normalize(routeOrPattern: string): string {
-  const stripped = routeOrPattern.replace(/^\//, "")
+  const stripped = routeOrPattern.startsWith("/")
+    ? routeOrPattern.slice(1)
+    : routeOrPattern
   return stripped === "" ? "index" : stripped
 }
 
-export interface PageMeta {
+export type PageMeta = {
   description: string
   title: string
 }
 
 // og:title is preferred over <title> because <title> carries the site template
 // (e.g. "About Us | Fixture Site") while og:title is the bare page title.
-export function pageMeta(metadata: unknown): PageMeta {
-  const doc =
-    (
-      metadata as {
-        document?: {
-          title?: string
-          description?: string
-          openGraph?: { title?: string; description?: string }
-        }
-      }
-    )?.document ?? {}
+export function pageMeta(metadata: HtmlMetadata | undefined): PageMeta {
+  const doc = metadata?.document
   return {
-    description: doc.description ?? doc.openGraph?.description ?? "",
-    title: doc.openGraph?.title ?? doc.title ?? "",
+    description: firstMetadata(doc?.description, doc?.openGraph?.description),
+    title: firstMetadata(doc?.openGraph?.title, doc?.title),
   }
+}
+
+function firstMetadata(...values: Array<string | undefined>): string {
+  return values.find((value) => value !== undefined) ?? ""
 }
 
 // Hrefs are path-absolute ("/index.md"), never origin-qualified.
@@ -126,7 +144,7 @@ export function linkHref(route: string, mdEnabled: boolean): string {
 
 export type Link = PageMeta & { route: string }
 
-interface Section {
+type Section = {
   links: Link[]
   segment: string
   title: string
@@ -139,9 +157,7 @@ export function groupLinks(links: Link[]): {
   root: Link[]
   sections: Section[]
 } {
-  const sorted = [...links].sort((a, b) =>
-    a.route < b.route ? -1 : a.route > b.route ? 1 : 0
-  )
+  const sorted = [...links].sort((a, b) => compareCodeUnits(a.route, b.route))
   const root = sorted.filter((link) => segmentsOf(link.route).length <= 1)
   const bySegment = new Map<string, Link[]>()
   for (const link of sorted) {
@@ -152,7 +168,7 @@ export function groupLinks(links: Link[]): {
     bySegment.set(segments[0], [...(bySegment.get(segments[0]) ?? []), link])
   }
   const sections = [...bySegment.entries()]
-    .sort(([a], [b]) => (a < b ? -1 : 1))
+    .sort(([a], [b]) => compareCodeUnits(a, b))
     .map(([segment, sectionLinks]) => ({
       links: sectionLinks,
       segment,
@@ -177,9 +193,31 @@ function segmentsOf(route: string): string[] {
 
 function humanize(segment: string): string {
   return segment
-    .split(/[-_]/)
+    .split(WORD_SEPARATOR)
     .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
     .join(" ")
+}
+
+// The same grouping the default index draws, handed to a user llmstxt function
+// so it can do its own sectioning. A section only exists when it has links —
+// an app with no root-level pages gets no empty leading block.
+export function llmstxtSections(
+  links: Link[],
+  mdEnabled: boolean
+): LlmstxtSection[] {
+  const entry = (link: Link): LlmstxtLink => ({
+    description: link.description,
+    href: linkHref(link.route, mdEnabled),
+    title: link.title,
+  })
+  const { root, sections } = groupLinks(links)
+  return [
+    { routes: root.map(entry), title: "" },
+    ...sections.map((section) => ({
+      routes: section.links.map(entry),
+      title: section.title,
+    })),
+  ].filter((section) => section.routes.length > 0)
 }
 
 export function renderIndex(
@@ -204,6 +242,18 @@ export function renderFull(site: PageMeta, sections: string[]): string {
   return `${[...renderHeader(site), ...sections].join("\n\n")}\n`
 }
 
+// The llms-full.txt entry for a route that publishes no body: the metadata the
+// page itself declared, plus the URL that renders it for whoever asks. A reader
+// of llms-full alone still learns the page exists and how to fetch it.
+export function renderStub(link: Link, mdEnabled: boolean): string {
+  const parts = [`# ${link.title}`.trimEnd()]
+  if (link.description) {
+    parts.push(`> ${link.description}`)
+  }
+  parts.push(`[Requires session](${linkHref(link.route, mdEnabled)})`)
+  return parts.join("\n\n")
+}
+
 function renderHeader(site: PageMeta): string[] {
   const parts = [`# ${site.title}`.trimEnd()]
   if (site.description) {
@@ -220,11 +270,15 @@ export function stripFrontmatter(markdown: string): string {
   if (end === -1) {
     return markdown
   }
-  return markdown.slice(end + 5).replace(/^\n+/, "")
+  let content = markdown.slice(end + 5)
+  while (content.startsWith("\n")) {
+    content = content.slice(1)
+  }
+  return content
 }
 
-export interface ResolvedMd {
-  content: string
+export type ResolvedMd = {
+  content?: string
   description?: string
   title?: string
 }
@@ -250,12 +304,12 @@ export async function evaluateMd(
   if (typeof value === "string") {
     return { content: value }
   }
-  if (
-    value &&
-    typeof value === "object" &&
-    typeof (value as { content?: unknown }).content === "string"
-  ) {
-    return value as ResolvedMd
+  if (value && typeof value === "object") {
+    const { content, title } = value as { content?: unknown; title?: unknown }
+    // a title alone is enough: that is the opt-in form, carrying no body
+    if (typeof content === "string" || typeof title === "string") {
+      return value as ResolvedMd
+    }
   }
   return null
 }
@@ -272,7 +326,7 @@ export function matchPattern(
     return null
   }
   const params: Record<string, string> = {}
-  for (let i = 0; i < patternSegments.length; i++) {
+  for (let i = 0; i < patternSegments.length; i += 1) {
     const segment = patternSegments[i]
     if (
       segment.startsWith("[") &&
@@ -289,6 +343,42 @@ export function matchPattern(
 
 export const CONVERT_OPTIONS = { excludeSelectors: ["footer"] }
 
+export function compareCodeUnits(a: string, b: string): number {
+  if (a < b) {
+    return -1
+  }
+  if (a > b) {
+    return 1
+  }
+  return 0
+}
+
+export function isPageFile(name: string): boolean {
+  const dot = name.lastIndexOf(".")
+  return (
+    name.slice(0, dot) === "page" &&
+    ["tsx", "jsx", "ts", "js", "mdx"].includes(name.slice(dot + 1))
+  )
+}
+
+// The body a page publishes: its md export's content when it declares one,
+// otherwise the rendered conversion. A titled export that declares no content
+// publishes nothing — null, meaning no .md twin is written and llms-full.txt
+// carries a stub. That is what keeps a gated page's rendering off every static
+// surface while still letting it appear in the index.
+export function publishedBody(
+  override: ResolvedMd | null,
+  converted: string | undefined
+): string | null {
+  if (override?.content !== undefined) {
+    return override.content
+  }
+  if (override?.title !== undefined) {
+    return null
+  }
+  return converted ?? ""
+}
+
 // The built HTML in .next/server/app IS the route list: prerendered pages
 // only, so auth-gated dynamic pages are absent by construction (dynamic
 // instances from generateStaticParams included). Returns null when no build
@@ -301,11 +391,11 @@ export function discoverBuiltRoutes(dir: string): string[] | null {
     }
     const routes: string[] = []
     walk(serverApp)
-    return routes.sort()
+    return routes.sort(compareCodeUnits)
 
     function walk(current: string): void {
       for (const entry of readdirSync(current, { withFileTypes: true })) {
-        const name = entry.name
+        const { name } = entry
         if (name.startsWith("_") || name.startsWith("%5F")) {
           continue
         }
@@ -328,6 +418,52 @@ export function discoverBuiltRoutes(dir: string): string[] | null {
     }
   } catch {
     return null
+  }
+}
+
+// Every page compiles to .next/server/app/<route>/page.js whether or not it
+// prerendered to HTML, so this is the one place a build can see the routes
+// discoverBuiltRoutes can't — the auth-gated and otherwise dynamic ones. Only
+// literal paths: /users/[id] has no concrete URL to publish, so a dynamic
+// segment ends that branch.
+export function discoverModuleRoutes(dir: string): string[] {
+  const serverApp = join(dir, ".next", "server", "app")
+  try {
+    if (!existsSync(serverApp)) {
+      return []
+    }
+    const routes: string[] = []
+    walk(serverApp, "")
+    return routes.sort(compareCodeUnits)
+
+    function walk(current: string, route: string): void {
+      for (const entry of readdirSync(current, { withFileTypes: true })) {
+        const { name } = entry
+        if (!entry.isDirectory()) {
+          if (name === "page.js") {
+            routes.push(route === "" ? "/" : route)
+          }
+          continue
+        }
+        // "page"/"route" hold a compiled page's manifests, and *.segments its
+        // RSC payloads — neither is a route segment. Dots are matched only at
+        // that suffix: /docs/v1.2 is a perfectly legal route directory.
+        if (
+          name.startsWith("_") ||
+          name.startsWith("%5F") ||
+          name.startsWith("@") ||
+          name.startsWith("[") ||
+          name === "page" ||
+          name === "route" ||
+          name.endsWith(".segments")
+        ) {
+          continue
+        }
+        walk(join(current, name), `${route}/${name}`)
+      }
+    }
+  } catch {
+    return []
   }
 }
 

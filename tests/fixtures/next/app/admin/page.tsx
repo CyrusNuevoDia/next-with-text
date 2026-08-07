@@ -1,4 +1,7 @@
-export const metadata = { title: "Admin", description: "Edge-protected static page." }
+export const metadata = {
+  description: "Edge-protected static page.",
+  title: "Admin",
+}
 
 export default function Admin() {
   return (

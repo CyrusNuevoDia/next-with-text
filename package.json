@@ -1,18 +1,7 @@
 {
   "name": "next-with-text",
-  "description": "llms.txt, llms-full.txt, and per-page markdown for Next.js — one line in next.config.ts",
   "version": "0.1.0",
-  "type": "module",
-  "license": "MIT",
-  "packageManager": "bun@1.3.14",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/CyrusNuevoDia/next-with-text.git"
-  },
-  "homepage": "https://github.com/CyrusNuevoDia/next-with-text#readme",
-  "bugs": {
-    "url": "https://github.com/CyrusNuevoDia/next-with-text/issues"
-  },
+  "description": "llms.txt, llms-full.txt, and per-page markdown for Next.js — one line in next.config.ts",
   "keywords": [
     "next",
     "nextjs",
@@ -21,13 +10,16 @@
     "markdown",
     "ai"
   ],
-  "publishConfig": {
-    "access": "public"
+  "homepage": "https://github.com/CyrusNuevoDia/next-with-text#readme",
+  "bugs": {
+    "url": "https://github.com/CyrusNuevoDia/next-with-text/issues"
   },
-  "files": [
-    "dist",
-    "src"
-  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CyrusNuevoDia/next-with-text.git"
+  },
+  "license": "MIT",
+  "type": "module",
   "exports": {
     ".": {
       "types": "./src/index.ts",
@@ -39,22 +31,34 @@
       "default": "./dist/route.js"
     }
   },
+  "files": [
+    "dist",
+    "src"
+  ],
   "scripts": {
     "build": "bun build src/index.ts --target=node --format=cjs --outfile=dist/index.cjs --packages=external && bun build src/patch.ts --target=node --format=cjs --outfile=dist/patch.cjs --external=@xberg-io/html-to-markdown && bun build src/route.ts --target=node --format=esm --outfile=dist/route.js --external=@xberg-io/html-to-markdown",
-    "test": "bun run build && bun test",
-    "prepack": "bun run build"
-  },
-  "peerDependencies": {
-    "next": ">=16"
+    "check": "ultracite check",
+    "fix": "ultracite fix",
+    "prepack": "bun run build",
+    "test": "bun run build && bun test"
   },
   "dependencies": {
     "@xberg-io/html-to-markdown": "^3.10.6",
     "multimatch": "^7.0.0"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.5.6",
     "@changesets/cli": "^2.31.0",
     "@types/bun": "latest",
     "@types/node": "^24",
-    "next": "latest"
+    "next": "latest",
+    "ultracite": "7.10.1"
+  },
+  "peerDependencies": {
+    "next": ">=16"
+  },
+  "packageManager": "bun@1.3.14",
+  "publishConfig": {
+    "access": "public"
   }
 }

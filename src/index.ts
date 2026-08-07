@@ -14,6 +14,7 @@ import {
   releaseGeneratedRoute,
 } from "./cleanup"
 import {
+  isPageFile,
   type ResolvedOptions,
   type RouteOptions,
   resolveOptions,
@@ -28,7 +29,7 @@ export type {
   WithTextOptions,
 } from "./shared"
 
-interface ConfigContext {
+type ConfigContext = {
   defaultConfig?: NextConfig
 }
 type ConfigFn = (
@@ -42,7 +43,7 @@ const PHASE_DEV = "phase-development-server"
 let patchRegistered = false
 let devCleanupRegistered = false
 
-interface Capture {
+type Capture = {
   llmstxt?: WithTextOptions["llmstxt"]
 }
 
@@ -183,14 +184,9 @@ function scanMdPages(
 
   function walk(dirPath: string, route: string): void {
     for (const entry of readdirSync(dirPath, { withFileTypes: true })) {
-      const name = entry.name
+      const { name } = entry
       if (entry.isDirectory()) {
-        if (
-          name.startsWith("_") ||
-          name.startsWith("%5F") ||
-          name.startsWith("@") ||
-          name.startsWith("[...")
-        ) {
+        if (isIgnoredAppDirectory(name)) {
           continue
         }
         walk(
@@ -199,27 +195,45 @@ function scanMdPages(
         )
         continue
       }
-      if (!/^page\.(tsx|jsx|ts|js|mdx)$/.test(name)) {
-        continue
-      }
-      const source = readFileSync(join(dirPath, name), "utf8")
-      if (
-        !/export\s+(?:const|let|var|async\s+function|function)\s+md\b/.test(
-          source
-        )
-      ) {
-        continue
-      }
-      const rel = relative(appDir, join(dirPath, name))
-        .split(sep)
-        .join("/")
-        .replace(/\.(tsx|jsx|ts|js|mdx)$/, "")
-      pages.push({
-        importPath: `../../${rel}`,
-        pattern: route === "" ? "/" : route,
-      })
+      addMdPage(pages, appDir, dirPath, route, name)
     }
   }
+}
+
+function addMdPage(
+  pages: Array<{ pattern: string; importPath: string }>,
+  appDir: string,
+  dirPath: string,
+  route: string,
+  name: string
+): void {
+  if (
+    !(
+      isPageFile(name) &&
+      MD_EXPORT.test(readFileSync(join(dirPath, name), "utf8"))
+    )
+  ) {
+    return
+  }
+  const relativePage = relative(appDir, join(dirPath, name))
+    .split(sep)
+    .join("/")
+  const rel = relativePage.slice(0, relativePage.lastIndexOf("."))
+  pages.push({
+    importPath: `../../${rel}`,
+    pattern: route === "" ? "/" : route,
+  })
+}
+
+const MD_EXPORT = /export\s+(?:const|let|var|async\s+function|function)\s+md\b/
+
+function isIgnoredAppDirectory(name: string): boolean {
+  return (
+    name.startsWith("_") ||
+    name.startsWith("%5F") ||
+    name.startsWith("@") ||
+    name.startsWith("[...")
+  )
 }
 
 type RewritesFn = NonNullable<NextConfig["rewrites"]>

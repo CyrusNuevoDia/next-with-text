@@ -5,11 +5,13 @@ export function generateStaticParams() {
   return [{ tag: "alpha" }, { tag: "beta" }]
 }
 
-export async function generateMetadata({ params }: PageProps<"/tags/[tag]">): Promise<Metadata> {
+export async function generateMetadata({
+  params,
+}: PageProps<"/tags/[tag]">): Promise<Metadata> {
   const { tag } = await params
   return {
-    title: `Tag: ${tag}`,
     description: `Pages tagged ${tag}.`,
+    title: `Tag: ${tag}`,
   }
 }
 

@@ -11,8 +11,8 @@ export async function generateMetadata({
 }): Promise<Metadata> {
   const { slug } = await params
   return {
-    title: `Post: ${slug}`,
     description: `Blog post about ${slug}.`,
+    title: `Post: ${slug}`,
   }
 }
 

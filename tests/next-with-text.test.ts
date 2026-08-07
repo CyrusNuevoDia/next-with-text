@@ -26,6 +26,7 @@ import {
   writeFileSync,
 } from "node:fs"
 import { join } from "node:path"
+import { sleep, spawn, spawnSync } from "bun"
 
 setDefaultTimeout(240_000)
 
@@ -37,6 +38,7 @@ const PUBLIC = join(FIXTURE, "public")
 const DEV_PORT = 4311
 const START_PORT = 4312
 const LOCAL_START_PORT = 4313
+const INDEX_LINK = /^- \[.+\]\(\/[^)]+\.md\): .+$/
 
 // the prune ownership probe: a generated file the user edits afterwards must
 // survive the local build that reclaims everything else
@@ -52,18 +54,21 @@ const GENERATED = [
   "docs/api/auth.md",
   "docs/api/tokens.md",
   "docs/getting-started.md",
+  "admin/reports.md",
   "tags/alpha.md",
   "tags/beta.md",
   "llms.txt",
   "llms-full.txt",
 ]
 
-// routes that must never produce a public file
+// routes that must never produce a public file — including /gated, which opts
+// into the index but declares no body, so it stays live and cookie-aware
 const NEVER_GENERATED = [
   "docs/internal/secrets.md",
   "account.md",
   "admin.md",
   "echo.md",
+  "gated.md",
 ]
 
 function cleanFixture(): void {
@@ -72,18 +77,18 @@ function cleanFixture(): void {
   for (const rel of [...GENERATED, ...NEVER_GENERATED]) {
     rmSync(join(PUBLIC, rel), { force: true })
   }
-  for (const dir of ["tags", "blog", "docs"]) {
+  for (const dir of ["tags", "blog", "docs", "admin"]) {
     rmSync(join(PUBLIC, dir), { force: true, recursive: true })
   }
 }
 
-async function ensureToolchain(): Promise<void> {
-  const build = Bun.spawnSync(["bun", "run", "build"], { cwd: ROOT })
+function ensureToolchain(): void {
+  const build = spawnSync(["bun", "run", "build"], { cwd: ROOT })
   if (build.exitCode !== 0) {
     throw new Error(`library build failed:\n${build.stderr.toString()}`)
   }
   if (!existsSync(join(FIXTURE, "node_modules"))) {
-    const install = Bun.spawnSync(["bun", "install"], { cwd: FIXTURE })
+    const install = spawnSync(["bun", "install"], { cwd: FIXTURE })
     if (install.exitCode !== 0) {
       throw new Error(`fixture install failed:\n${install.stderr.toString()}`)
     }
@@ -97,7 +102,7 @@ async function ensureToolchain(): Promise<void> {
 // CI=1 makes the build deploy-shaped (static tier written to public/) no
 // matter where the suite runs; the local-build describe overrides it away.
 async function buildFixture(env: Record<string, string> = {}): Promise<void> {
-  const proc = Bun.spawn([NEXT_BIN, "build"], {
+  const proc = spawn([NEXT_BIN, "build"], {
     cwd: FIXTURE,
     env: { ...process.env, CI: "1", ...env },
     stderr: "pipe",
@@ -112,21 +117,21 @@ async function buildFixture(env: Record<string, string> = {}): Promise<void> {
   }
 }
 
-interface Server {
+type Server = {
   logs: () => string
   stop: () => Promise<void>
 }
 
 async function startServer(args: string[], port: number): Promise<Server> {
   // a stale server on the port makes every assertion meaningless — fail loudly
-  const squatter = Bun.spawnSync(["lsof", "-ti", `:${port}`])
+  const squatter = spawnSync(["lsof", "-ti", `:${port}`])
   if (squatter.stdout.toString().trim() !== "") {
     throw new Error(
       `port ${port} is already in use: pid(s) ${squatter.stdout.toString().trim()}`
     )
   }
 
-  const proc = Bun.spawn([NEXT_BIN, ...args, "-p", String(port)], {
+  const proc = spawn([NEXT_BIN, ...args, "-p", String(port)], {
     cwd: FIXTURE,
     stderr: "pipe",
     stdout: "pipe",
@@ -140,31 +145,46 @@ async function startServer(args: string[], port: number): Promise<Server> {
   capture(proc.stdout)
   capture(proc.stderr)
 
-  const deadline = Date.now() + 120_000
-  while (Date.now() < deadline) {
-    if (proc.exitCode !== null) {
-      throw new Error(`server exited early (${proc.exitCode}):\n${logs}`)
-    }
-    try {
-      await fetch(`http://localhost:${port}/`, {
-        signal: AbortSignal.timeout(2000),
-      })
-      break
-    } catch {
-      await Bun.sleep(500)
-    }
-  }
+  await pollUntil(
+    async () => {
+      if (proc.exitCode !== null) {
+        throw new Error(`server exited early (${proc.exitCode}):\n${logs}`)
+      }
+      try {
+        await fetch(`http://localhost:${port}/`, {
+          signal: AbortSignal.timeout(2000),
+        })
+        return true
+      } catch {
+        return false
+      }
+    },
+    Date.now() + 120_000,
+    500
+  )
 
   return {
     logs: () => logs,
     stop: async () => {
       proc.kill()
-      await Promise.race([
-        proc.exited,
-        Bun.sleep(5000).then(() => proc.kill(9)),
-      ])
+      await Promise.race([proc.exited, sleep(5000).then(() => proc.kill(9))])
     },
   }
+}
+
+async function pollUntil(
+  condition: () => boolean | Promise<boolean>,
+  deadline: number,
+  interval: number
+): Promise<boolean> {
+  if (await condition()) {
+    return true
+  }
+  if (Date.now() >= deadline) {
+    return false
+  }
+  await sleep(interval)
+  return pollUntil(condition, deadline, interval)
 }
 
 function get(
@@ -188,7 +208,7 @@ function assertOrder(body: string, ...needles: string[]): void {
     expect(`${at >= 0} ${n}`).toBe(`true ${n}`)
     return at
   })
-  for (let i = 1; i < positions.length; i++) {
+  for (let i = 1; i < positions.length; i += 1) {
     expect(positions[i]).toBeGreaterThan(positions[i - 1])
   }
 }
@@ -202,13 +222,13 @@ describe("next dev", () => {
   let server: Server
 
   beforeAll(async () => {
-    await ensureToolchain()
+    ensureToolchain()
     cleanFixture()
     server = await startServer(["dev"], DEV_PORT)
   })
 
   afterAll(async () => {
-    await server?.stop()
+    await server.stop()
   })
 
   test("GET /llms.txt returns the sectioned index", async () => {
@@ -259,6 +279,19 @@ describe("next dev", () => {
     expect(await authed.text()).toContain("session=abc123")
   })
 
+  test("dev agrees with the build on what a gated opt-in publishes", async () => {
+    const index = await (await get(DEV_PORT, "/llms.txt")).text()
+    expect(index).toContain("- [MD_TITLE_GATED](/gated.md): MD_DESC_GATED")
+
+    const full = await (await get(DEV_PORT, "/llms-full.txt")).text()
+    expect(full).toContain(
+      "# MD_TITLE_GATED\n\n> MD_DESC_GATED\n\n[Requires session](/gated.md)"
+    )
+    // dev renders the page happily for a signed-out visitor; the point is that
+    // the surface still refuses to inline it
+    expect(full).not.toContain("SENTINEL_GATED")
+  })
+
   test("check 24 (dev): params reach the md function", async () => {
     expect(await (await get(DEV_PORT, "/tags/alpha.md")).text()).toContain(
       "MD_TAG_alpha"
@@ -291,10 +324,7 @@ describe("next dev", () => {
     const routeDir = join(FIXTURE, "app", "%5Fllms")
     expect(existsSync(routeDir)).toBe(true) // dev compiles from source — it must exist while serving
     await server.stop()
-    const deadline = Date.now() + 10_000
-    while (existsSync(routeDir) && Date.now() < deadline) {
-      await Bun.sleep(200)
-    }
+    await pollUntil(() => !existsSync(routeDir), Date.now() + 10_000, 200)
     expect(existsSync(routeDir)).toBe(false)
     const devValidator = join(FIXTURE, ".next", "dev", "types", "validator.ts")
     if (existsSync(devValidator)) {
@@ -311,6 +341,9 @@ describe("next dev", () => {
 describe("next build", () => {
   beforeAll(async () => {
     cleanFixture()
+    // what an earlier build would have left at a route that now publishes no
+    // body — it must be reclaimed, or it shadows the live per-requester render
+    writeFileSync(join(PUBLIC, "gated.md"), "STALE_GATED: captured render\n")
     await buildFixture()
   })
 
@@ -326,7 +359,7 @@ describe("next build", () => {
       "utf8"
     )
     expect(validator).not.toContain("%5Fllms")
-    const tsc = Bun.spawnSync(["bunx", "tsc", "--noEmit"], { cwd: FIXTURE })
+    const tsc = spawnSync(["bunx", "tsc", "--noEmit"], { cwd: FIXTURE })
     expect(tsc.stdout.toString() + tsc.stderr.toString()).toBe("")
     expect(tsc.exitCode).toBe(0)
   })
@@ -362,7 +395,7 @@ describe("next build", () => {
     )
     // every link line is `- [title](/route.md): description`
     for (const line of body.split("\n").filter((l) => l.startsWith("- "))) {
-      expect(line).toMatch(/^- \[.+\]\(\/[^)]+\.md\): .+$/)
+      expect(line).toMatch(INDEX_LINK)
     }
   })
 
@@ -408,6 +441,55 @@ describe("next build", () => {
       "- [MD_TITLE_PLAIN](/plain.md): MD_DESC_PLAIN"
     )
     expect(read("plain.md")).toContain("MD_CONTENT_PLAIN")
+  })
+
+  test("a stale .md at an opted-in route's path is reclaimed", () => {
+    expect(existsSync(join(PUBLIC, "gated.md"))).toBe(false)
+    for (const rel of GENERATED) {
+      expect(read(rel)).not.toContain("STALE_GATED")
+    }
+  })
+
+  test("gated dynamic page opts into the index via a content-less md export", () => {
+    expect(read("llms.txt")).toContain(
+      "- [MD_TITLE_GATED](/gated.md): MD_DESC_GATED"
+    )
+  })
+
+  test("the opted-in gated route publishes a stub, never its rendering", () => {
+    const body = read("llms-full.txt")
+    expect(body).toContain(
+      "# MD_TITLE_GATED\n\n> MD_DESC_GATED\n\n[Requires session](/gated.md)"
+    )
+    // the page renders fine for a signed-out visitor — that is exactly what
+    // must not be captured into a static file
+    expect(body).not.toContain("SENTINEL_GATED")
+    expect(body).not.toContain("OG_TITLE_GATED")
+    expect(existsSync(join(PUBLIC, "gated.md"))).toBe(false)
+  })
+
+  test("proxy-guarded route opts in with content, and only that content ships", () => {
+    expect(read("llms.txt")).toContain(
+      "- [MD_TITLE_REPORTS](/admin/reports.md): MD_DESC_REPORTS"
+    )
+    expect(read("admin/reports.md")).toContain("MD_CONTENT_REPORTS")
+    const full = read("llms-full.txt")
+    expect(full).toContain("MD_CONTENT_REPORTS")
+    // the guarded page's own rendering stays out of every surface
+    for (const rel of GENERATED) {
+      expect(read(rel)).not.toContain("SENTINEL_REPORTS")
+    }
+    expect(full).not.toContain("OG_TITLE_REPORTS")
+    // and the guarded route that did NOT opt in is still absent
+    expect(read("llms.txt")).not.toContain("(/admin.md)")
+  })
+
+  test("an exclude pattern beats a page's own opt-in", () => {
+    const index = read("llms.txt")
+    expect(index).not.toContain("MD_TITLE_SECRETS")
+    expect(index).not.toContain("/docs/internal/")
+    expect(read("llms-full.txt")).not.toContain("MD_TITLE_SECRETS")
+    expect(existsSync(join(PUBLIC, "docs/internal/secrets.md"))).toBe(false)
   })
 
   test("check 17: object-form md content wins in the .md twin and llms-full", () => {
@@ -513,7 +595,7 @@ describe("next start", () => {
   })
 
   afterAll(async () => {
-    await server?.stop()
+    await server.stop()
   })
 
   test("llms surfaces serve over HTTP", async () => {
@@ -603,6 +685,31 @@ describe("next start", () => {
     expect(negotiatedBody).not.toContain("<article")
   })
 
+  test("opted-in /gated.md renders live and privately per requester", async () => {
+    const anonymous = await get(START_PORT, "/gated.md")
+    expect(anonymous.status).toBe(200)
+    expect(await anonymous.text()).toContain("session=none")
+
+    const authed = await get(START_PORT, "/gated.md", {
+      cookie: "session=abc123",
+    })
+    expect(await authed.text()).toContain("session=abc123")
+    // rendered from the caller's cookies — a shared cache must not keep it
+    expect(authed.headers.get("cache-control")).toBe("private, no-store")
+  })
+
+  test("opted-in /admin/reports.md serves its declared content behind the guard", async () => {
+    // the proxy matcher covers /admin/:path*, so the anonymous request is
+    // turned away before anything of ours runs
+    expect((await get(START_PORT, "/admin/reports.md")).status).toBe(307)
+    const authed = await get(START_PORT, "/admin/reports.md", {
+      cookie: "session=abc123",
+    })
+    const body = await authed.text()
+    expect(body).toContain("MD_CONTENT_REPORTS")
+    expect(body).not.toContain("SENTINEL_REPORTS")
+  })
+
   test("proxy-guarded /admin.md stays gated on demand", async () => {
     expect((await get(START_PORT, "/admin.md")).status).toBe(404)
     const authed = await get(START_PORT, "/admin.md", {
@@ -631,7 +738,23 @@ describe("llmstxt function build", () => {
     expect(body).not.toContain("## ")
   })
 
-  test("check 23: ctx.routes is flat, hrefs are .md, index precedence applied", () => {
+  test("check 23: ctx.sections carry the grouping, and none is empty", () => {
+    const body = read("llms.txt")
+    const lines = body.split("\n")
+    // the unheaded root block comes first, then a section per path segment
+    expect(lines[1]).toBe("SECTION:")
+    expect(body).toContain("SECTION:Docs")
+    expect(body).toContain("SECTION:Admin")
+    expect(body).toContain("SECTION:Tags")
+    // every section handed to the function has at least one route under it
+    for (const [i, line] of lines.entries()) {
+      if (line.startsWith("SECTION:")) {
+        expect(`${line} -> ${lines[i + 1]}`).toContain("-> ROUTE:")
+      }
+    }
+  })
+
+  test("check 23: hrefs are .md, index precedence applied", () => {
     const body = read("llms.txt")
     expect(body).toContain(
       "ROUTE:MD_TITLE_TOKENS|/docs/api/tokens.md|MD_DESC_TOKENS"
@@ -672,7 +795,7 @@ describe("local build — no deploy env", () => {
   })
 
   afterAll(async () => {
-    await server?.stop()
+    await server.stop()
   })
 
   test("public/ carries no generated files after a local build", () => {
@@ -716,6 +839,16 @@ describe("local build — no deploy env", () => {
     expect(body).not.toContain("/echo.md")
   })
 
+  test("the on-demand index agrees with the static tier on gated opt-ins", async () => {
+    const body = await (await get(LOCAL_START_PORT, "/llms.txt")).text()
+    expect(body).toContain("- [MD_TITLE_GATED](/gated.md): MD_DESC_GATED")
+    expect(body).toContain(
+      "- [MD_TITLE_REPORTS](/admin/reports.md): MD_DESC_REPORTS"
+    )
+    // opting one /admin route in does not drag the rest of the guard with it
+    expect(body).not.toContain("(/admin.md)")
+  })
+
   test("llms-full.txt serves on demand", async () => {
     const res = await get(LOCAL_START_PORT, "/llms-full.txt")
     expect(res.status).toBe(200)
@@ -732,6 +865,13 @@ describe("local build — no deploy env", () => {
     expect(body).not.toContain("SENTINEL_ADMIN")
     expect(body).not.toContain("SENTINEL_ACCOUNT")
     expect(body).not.toContain("SENTINEL_SECRETS")
+    // gated opt-ins publish exactly what they declared, here as everywhere
+    expect(body).toContain(
+      "# MD_TITLE_GATED\n\n> MD_DESC_GATED\n\n[Requires session](/gated.md)"
+    )
+    expect(body).toContain("MD_CONTENT_REPORTS")
+    expect(body).not.toContain("SENTINEL_GATED")
+    expect(body).not.toContain("SENTINEL_REPORTS")
   })
 
   test(".md twins and Accept negotiation serve on demand", async () => {

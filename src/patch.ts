@@ -18,32 +18,38 @@ import { dirname, join } from "node:path"
 import { convert } from "@xberg-io/html-to-markdown"
 import {
   CONVERT_OPTIONS,
+  compareCodeUnits,
   discoverBuiltRoutes,
+  discoverModuleRoutes,
   evaluateMd,
   type Link,
   type LlmstxtContext,
-  linkHref,
+  llmstxtSections,
   matchesRoute,
   orderLinks,
   type PageMeta,
   pageMeta,
+  publishedBody,
   type ResolvedMd,
   type ResolvedOptions,
   readProxyMatchers,
   renderFull,
   renderIndex,
+  renderStub,
   stripFrontmatter,
 } from "./shared"
 
 const MANIFEST = "next-with-text-manifest.json"
 
-interface Payload {
+type Payload = {
   dir: string
   hasLlmstxt: boolean
   options: ResolvedOptions
 }
-interface Page {
-  content: string
+type Page = {
+  // null when the page publishes no body: nothing to write as a .md twin, and
+  // a stub rather than an inlined section in llms-full.txt
+  content: string | null
   meta: PageMeta
   rendered: PageMeta
   route: string
@@ -62,30 +68,30 @@ async function main({ dir, options, hasLlmstxt }: Payload): Promise<void> {
   }
 
   const proxyMatchers = readProxyMatchers(dir)
-  const routes = (discoverBuiltRoutes(dir) ?? [])
+  const prerendered = new Set(discoverBuiltRoutes(dir) ?? [])
+  // A route is gated when the build prerendered no HTML for it (it read
+  // cookies/headers, or redirected) or a proxy matcher guards it. Gated routes
+  // publish nothing at all unless the page opts in with a titled md export —
+  // and even then only what that export declares, never rendered output.
+  const gatedRoute = (route: string) =>
+    !prerendered.has(route) || proxyMatchers.some((re) => re.test(route))
+  const routes = [...new Set([...prerendered, ...discoverModuleRoutes(dir)])]
     .filter((route) => matchesRoute(route, options))
-    .filter((route) => !proxyMatchers.some((re) => re.test(route)))
+    .sort(compareCodeUnits)
 
-  const pages: Page[] = []
-  for (const route of routes) {
-    const html = readFileSync(
-      join(serverApp, route === "/" ? "index.html" : `${route.slice(1)}.html`),
-      "utf8"
+  const builtPages = await Promise.all(
+    routes.map((route) => buildPage(serverApp, route, gatedRoute(route)))
+  )
+  const pages = builtPages.filter((page): page is Page => page !== null)
+  const optedIn = pages
+    .filter((page) => gatedRoute(page.route))
+    .map((page) => page.route)
+  if (optedIn.length > 0) {
+    // the one way a route Next kept off the static surfaces gets published —
+    // say so by name, so it can never happen quietly
+    console.log(
+      `[next-with-text] ${optedIn.length} gated route(s) opted into the index via md export: ${optedIn.join(", ")}`
     )
-    const result = convert(html, CONVERT_OPTIONS)
-    const rendered = pageMeta(result.metadata)
-    const override = await pageOverride(serverApp, route)
-    pages.push({
-      content: override?.content ?? result.content ?? "",
-      // object-form md exports curate the page's index entry; string form
-      // keeps the rendered metadata
-      meta: {
-        description: override?.description ?? rendered.description,
-        title: override?.title ?? rendered.title,
-      },
-      rendered,
-      route,
-    })
   }
 
   const site = pages.find((page) => page.route === "/")?.rendered ?? {
@@ -96,45 +102,7 @@ async function main({ dir, options, hasLlmstxt }: Payload): Promise<void> {
     route: page.route,
     ...page.meta,
   }))
-  const byRoute = new Map(pages.map((page) => [page.route, page]))
-  const writes: [rel: string, content: string][] = []
-
-  if (options.md) {
-    for (const page of pages) {
-      const rel = page.route === "/" ? "index.md" : `${page.route.slice(1)}.md`
-      writes.push([
-        rel,
-        page.content.endsWith("\n") ? page.content : `${page.content}\n`,
-      ])
-    }
-  }
-
-  // the llmstxt function can't cross into this process as JSON — re-load the
-  // user's next config (capture mode) to reach it; its return IS the file body
-  const llmstxt = hasLlmstxt ? await loadLlmstxt(dir) : undefined
-  writes.push([
-    "llms.txt",
-    llmstxt
-      ? llmstxt({
-          description: site.description,
-          routes: orderLinks(links).map((link) => ({
-            description: link.description,
-            href: linkHref(link.route, options.md),
-            title: link.title,
-          })),
-          title: site.title,
-        })
-      : renderIndex(site, links, options.md),
-  ])
-  writes.push([
-    "llms-full.txt",
-    renderFull(
-      site,
-      orderLinks(links).map((link) =>
-        stripFrontmatter(byRoute.get(link.route)?.content ?? "").trim()
-      )
-    ),
-  ])
+  const writes = await buildWrites(dir, options, hasLlmstxt, pages, site, links)
 
   const publicDir = join(dir, "public")
   // The public/ tier is a deploy artifact: local builds skip it (the on-demand
@@ -145,27 +113,161 @@ async function main({ dir, options, hasLlmstxt }: Payload): Promise<void> {
   // mirror the writes so the copied tree matches (it lives inside .next, so
   // it's written regardless of the deploy gate)
   const standalonePublic = join(dir, ".next", "standalone", "public")
-  const written: Record<string, string> = {}
-  for (const [rel, content] of writes) {
-    const targets = [
-      ...(emitStatic ? [publicDir] : []),
-      ...(existsSync(standalonePublic) ? [standalonePublic] : []),
-    ]
-    for (const base of targets) {
-      const target = join(base, rel)
-      mkdirSync(dirname(target), { recursive: true })
-      writeFileSync(target, content)
-    }
-    if (emitStatic) {
-      written[rel] = hashOf(content)
-    }
-  }
+  const targets = [
+    ...(emitStatic ? [publicDir] : []),
+    ...(existsSync(standalonePublic) ? [standalonePublic] : []),
+  ]
+  const written = writeOutputs(writes, targets, emitStatic)
 
+  reclaimShadowed(
+    [publicDir, ...(existsSync(standalonePublic) ? [standalonePublic] : [])],
+    pages,
+    options.md
+  )
   prune(dir, publicDir, written)
   console.log(
     emitStatic
       ? `[next-with-text] generated ${Object.keys(written).length} file(s) into public/`
       : "[next-with-text] local build — public/ untouched; llms surfaces serve on demand (set NEXT_WITH_TEXT_STATIC=1 to write them)"
+  )
+}
+
+async function buildWrites(
+  dir: string,
+  options: ResolvedOptions,
+  hasLlmstxt: boolean,
+  pages: Page[],
+  site: PageMeta,
+  links: Link[]
+): Promise<[rel: string, content: string][]> {
+  const writes: [rel: string, content: string][] = options.md
+    ? pages.flatMap((page) => {
+        if (page.content === null) {
+          return []
+        }
+        const rel =
+          page.route === "/" ? "index.md" : `${page.route.slice(1)}.md`
+        const content = page.content.endsWith("\n")
+          ? page.content
+          : `${page.content}\n`
+        return [[rel, content]]
+      })
+    : []
+  // the llmstxt function can't cross into this process as JSON — re-load the
+  // user's next config (capture mode) to reach it; its return IS the file body
+  const llmstxt = hasLlmstxt ? await loadLlmstxt(dir) : undefined
+  writes.push([
+    "llms.txt",
+    llmstxt
+      ? llmstxt({
+          description: site.description,
+          sections: llmstxtSections(links, options.md),
+          title: site.title,
+        })
+      : renderIndex(site, links, options.md),
+  ])
+  const byRoute = new Map(pages.map((page) => [page.route, page]))
+  writes.push([
+    "llms-full.txt",
+    renderFull(
+      site,
+      orderLinks(links).map((link) => {
+        const content = byRoute.get(link.route)?.content
+        return content === null || content === undefined
+          ? renderStub(link, options.md)
+          : stripFrontmatter(content).trim()
+      })
+    ),
+  ])
+  return writes
+}
+
+function writeOutputs(
+  writes: [rel: string, content: string][],
+  targets: string[],
+  trackHashes: boolean
+): Record<string, string> {
+  const written: Record<string, string> = {}
+  for (const [rel, content] of writes) {
+    for (const base of targets) {
+      const target = join(base, rel)
+      mkdirSync(dirname(target), { recursive: true })
+      writeFileSync(target, content)
+    }
+    if (trackHashes) {
+      written[rel] = hashOf(content)
+    }
+  }
+  return written
+}
+
+async function buildPage(
+  serverApp: string,
+  route: string,
+  gated: boolean
+): Promise<Page | null> {
+  const override = await pageOverride(serverApp, route)
+  if (gated && !override?.title) {
+    return null
+  }
+  const result = gated
+    ? null
+    : convert(readFileSync(htmlPath(serverApp, route), "utf8"), CONVERT_OPTIONS)
+  const rendered = result
+    ? pageMeta(result.metadata)
+    : { description: "", title: "" }
+  return {
+    content: publishedBody(override, result?.content),
+    // object-form md exports curate the page's index entry; string form keeps
+    // the rendered metadata
+    meta: {
+      description: override?.description ?? rendered.description,
+      title: override?.title ?? rendered.title,
+    },
+    rendered,
+    route,
+  }
+}
+
+// A route that publishes no body must never be shadowed by a file left at its
+// path — that would serve a captured render where the live, per-requester one
+// belongs. Unlike prune() this ignores the manifest and the content hash: the
+// file cannot be allowed to stay whatever its provenance.
+function reclaimShadowed(
+  bases: string[],
+  pages: Page[],
+  mdEnabled: boolean
+): void {
+  if (!mdEnabled) {
+    return
+  }
+  for (const page of pages) {
+    if (page.content !== null) {
+      continue
+    }
+    const rel = page.route === "/" ? "index.md" : `${page.route.slice(1)}.md`
+    let removed = false
+    for (const base of bases) {
+      const target = join(base, rel)
+      if (!existsSync(target)) {
+        continue
+      }
+      rmSync(target, { force: true })
+      removeEmptyParents(base, dirname(target))
+      removed = true
+    }
+    if (removed) {
+      console.log(
+        `[next-with-text] removed public/${rel}: ${page.route} publishes no body, so it must serve live`
+      )
+    }
+  }
+}
+
+function htmlPath(serverApp: string, route: string): string {
+  return join(
+    serverApp,
+    route === "/" ? "index.html" : `${route.slice(1)}.html`
   )
 }
 
@@ -198,22 +300,38 @@ async function pageOverride(
   ;(globalThis as Record<string, unknown>).AsyncLocalStorage ??=
     require("node:async_hooks").AsyncLocalStorage
   try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const routeModule = (require(located.pageJs) as any).routeModule
-    let node = routeModule?.userland?.loaderTree
-    while (node) {
-      const [segment, parallelRoutes, mods] = node
-      if (segment === "__PAGE__") {
-        const userland = await mods.page[0]()
-        // static output can't depend on the query string — searchParams is {}
-        return await evaluateMd(userland.md, located.params, {})
-      }
-      node = parallelRoutes?.children
+    const { routeModule } = require(located.pageJs) as CompiledPageModule
+    const loader = findPageLoader(routeModule?.userland?.loaderTree)
+    if (loader) {
+      const userland = await loader()
+      // static output can't depend on the query string — searchParams is {}
+      return await evaluateMd(userland.md, located.params, {})
     }
   } catch {
     // pages that can't load outside the server runtime fall back to HTML conversion
   }
   return null
+}
+
+type PageLoader = () => Promise<{ md?: unknown }>
+type LoaderTree = [
+  segment: string,
+  parallelRoutes: { children?: LoaderTree },
+  modules: { page?: [PageLoader, ...unknown[]] },
+]
+type CompiledPageModule = {
+  routeModule?: { userland?: { loaderTree?: LoaderTree } }
+}
+
+function findPageLoader(tree: LoaderTree | undefined): PageLoader | undefined {
+  let node = tree
+  while (node) {
+    const [segment, parallelRoutes, modules] = node
+    if (segment === "__PAGE__") {
+      return modules.page?.[0]
+    }
+    node = parallelRoutes.children
+  }
 }
 
 // Maps a concrete route to its compiled page module, resolving [param]

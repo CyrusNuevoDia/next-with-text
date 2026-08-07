@@ -1,8 +1,8 @@
 import type { Metadata } from "next"
 
 export const metadata: Metadata = {
-  title: "API Auth",
   description: "Authenticating against the API.",
+  title: "API Auth",
 }
 
 export default function APIAuth() {

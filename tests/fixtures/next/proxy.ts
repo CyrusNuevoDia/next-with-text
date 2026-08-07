@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from "next/server"
+import { type NextRequest, NextResponse } from "next/server"
 
 export default function proxy(req: NextRequest) {
   if (!req.cookies.get("session")) {

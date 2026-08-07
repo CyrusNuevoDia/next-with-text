@@ -2,8 +2,8 @@ import type { Metadata } from "next"
 import type { MarkdownPage } from "next-with-text"
 
 export const metadata: Metadata = {
-  title: "Echo",
   description: "Dynamic page that echoes its query string.",
+  title: "Echo",
 }
 
 export default async function Echo({ searchParams }: PageProps<"/echo">) {
