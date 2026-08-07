@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        name: checkout
+      - uses: oven-sh/setup-bun@v2
+        name: setup[bun]
+        with:
+          bun-version-file: package.json
+      - uses: actions/setup-node@v6
+        name: setup[node]
+        with:
+          node-version: "24"
+      - name: deps
+        run: bun install --frozen-lockfile
+      - name: test
+        run: bun run test

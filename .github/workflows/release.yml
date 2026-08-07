@@ -1,0 +1,211 @@
+name: release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Exact version commit to build and publish
+        required: false
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+    outputs:
+      publish: ${{ steps.release.outputs.publish }}
+      release_sha: ${{ steps.release.outputs.release_sha }}
+    steps:
+      - uses: actions/checkout@v6
+        name: checkout
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.release_sha || github.sha }}
+      - uses: oven-sh/setup-bun@v2
+        name: setup[bun]
+        with:
+          bun-version-file: package.json
+      - uses: actions/setup-node@v6
+        name: setup[node]
+        with:
+          node-version: "24"
+      - name: deps
+        run: bun install --frozen-lockfile
+      - name: test
+        run: bun run test
+      - id: release
+        name: version-or-select-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          echo "publish=false" >> "$GITHUB_OUTPUT"
+          echo "release_sha=" >> "$GITHUB_OUTPUT"
+
+          if [[ -n "$REQUESTED_RELEASE_SHA" ]]; then
+            actual_sha="$(git rev-parse HEAD)"
+            if [[ "$actual_sha" != "$REQUESTED_RELEASE_SHA" ]]; then
+              echo "Requested release SHA $REQUESTED_RELEASE_SHA, checked out $actual_sha" >&2
+              exit 1
+            fi
+            if compgen -G ".changeset/*.md" > /dev/null; then
+              echo "Release commit still contains changesets" >&2
+              exit 1
+            fi
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "release_sha=$actual_sha" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! compgen -G ".changeset/*.md" > /dev/null; then
+            echo "No changesets and no requested release SHA; nothing to release."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          bun changeset version
+          bun install --lockfile-only
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "changeset version produced no changes" >&2
+            exit 1
+          fi
+
+          git commit -m "chore(release): bump next-with-text version"
+          release_sha="$(git rev-parse HEAD)"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          gh workflow run release.yml \
+            --ref "$GITHUB_REF_NAME" \
+            -f "release_sha=$release_sha"
+          echo "Dispatched publication run for $release_sha"
+
+  build:
+    if: needs.prepare.outputs.publish == 'true'
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        name: checkout
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+      - uses: oven-sh/setup-bun@v2
+        name: setup[bun]
+        with:
+          bun-version-file: package.json
+      - name: deps
+        run: bun install --frozen-lockfile
+      - id: package
+        name: pack
+        run: |
+          mkdir -p "$RUNNER_TEMP/release"
+          bun run build
+          npm pack --pack-destination "$RUNNER_TEMP/release"
+          echo "version=$(jq -r '.version' package.json)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        name: upload[npm]
+        with:
+          name: npm-package
+          path: ${{ runner.temp }}/release/*.tgz
+          if-no-files-found: error
+
+  publish-npm:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v6
+        name: setup[node]
+        with:
+          node-version: "24"
+          package-manager-cache: false
+          registry-url: https://registry.npmjs.org
+      - name: setup[npm]
+        run: npm install --global npm@11.13.0
+      - uses: actions/download-artifact@v8
+        name: download[npm]
+        with:
+          name: npm-package
+          path: ${{ runner.temp }}/release/npm
+      - id: registry
+        name: inspect[npm]
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          response="$RUNNER_TEMP/npm-registry.json"
+          code="$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "https://registry.npmjs.org/next-with-text/$VERSION")"
+          if [[ "$code" == "200" ]]; then
+            local="sha512-$(openssl dgst -sha512 -binary "$RUNNER_TEMP"/release/npm/*.tgz | base64 -w0)"
+            remote="$(jq -r '.dist.integrity' "$response")"
+            if [[ "$local" != "$remote" ]]; then
+              echo "npm already has $VERSION with different contents: local=$local remote=$remote" >&2
+              exit 1
+            fi
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$code" == "404" ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "npm registry returned HTTP $code" >&2
+            exit 1
+          fi
+      - if: steps.registry.outputs.publish == 'true'
+        name: publish[npm]
+        run: npm publish "$RUNNER_TEMP"/release/npm/*.tgz
+      - name: verify[npm]
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          local="sha512-$(openssl dgst -sha512 -binary "$RUNNER_TEMP"/release/npm/*.tgz | base64 -w0)"
+          response="$RUNNER_TEMP/npm-registry.json"
+          for _ in {1..12}; do
+            code="$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "https://registry.npmjs.org/next-with-text/$VERSION")"
+            if [[ "$code" == "200" && "$(jq -r '.dist.integrity' "$response")" == "$local" ]]; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "npm did not expose the expected artifact" >&2
+          exit 1
+
+  finalize:
+    needs: [prepare, build, publish-npm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        name: checkout
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.release_sha }}
+      - name: tag
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          tag="v$VERSION"
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            if [[ "$(git rev-list -n 1 "$tag")" != "${{ needs.prepare.outputs.release_sha }}" ]]; then
+              echo "$tag points to an unexpected commit" >&2
+              exit 1
+            fi
+          else
+            git tag "$tag"
+          fi
+          git push origin "refs/tags/$tag"
