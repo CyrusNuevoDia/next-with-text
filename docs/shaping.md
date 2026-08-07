@@ -1,0 +1,248 @@
+---
+shaping: true
+---
+
+# next-with-text — Shaping
+
+The package publishes as **`next-with-text`**. The `next-llms-txt` npm name is taken by an unrelated package (bke-daniel, ~800 downloads/week, dormant since Dec 2025) — a runtime proxy handler that Babel-parses `src/app` source per request for static metadata exports, serves title/description stubs instead of page content, and breaks on Vercel/standalone deploys because the source tree isn't in the bundle (its own demo serves a pageless index). Not a capability competitor; not worth pursuing the name (npm dispute would fail — the repo still merges dependabot PRs). `next-with-text` names the API literally and stays clear of conflation; alternatives considered: `next-txt` (fine, superseded), `next-llmstxt`/`nextjs-llms-txt` (one typo from the incumbent — pass). Keep `llms.txt`/`llmstxt`/`llms-full.txt` prominent in package keywords and the README first paragraph; discoverability comes from keywords, not the name. The API is `withText`.
+
+## Frame
+
+### Source
+
+> Let's figure out how we might build a nextjs plugin or adapter or whatever makes sense whereby we can do something like llmstxt({config...}) in next.config.ts, and the config accepts like path globs to include/exclude (kinda like a gitignore, we can use sindresorhus' lib here) (paths = routes, not filepaths) and it auto-generates an llms.txt/route.ts and a llms-full.txt/route.ts. one should also be able to configure the preamble in these. this could be a library too, doesn't have to be a plugin/adapter, because ideally they configure the preamble in llms.txt/route.ts and llms-full.txt/route.ts.
+
+> yeah build-time is the way to go here. also, the include/exclude is gonna get shared over llms.txt and llms-full.txt so better to have a single place where we can put them. and the thing is, even that is shared. it's good to be able to override it per-route but the thing is that the config is gonna be global by default because that's how it's gonna be used (convention). so we need some good pattern here.
+
+> i imagine as a build-step we can get the compiled html as well as the raw .tsx/.jsx, and then sorta walk them you know and deterministically turn them into .md and then we can use that easily. it would also be really awesome if we could auto-turn routes like say /about and have a /about.md or make it so that if accept: text/markdown goes to /about it returns markdown, basically people should stop needing to implement markdown/txt rendering themselves.
+
+> Let's make it `withText(...)` not `withLlms`.
+
+> it would also be cool if in individual routes people could also do an export const md = async (): Promise<string> => {} or md = (): string, this way we can fold those in / use those as overrides.
+
+> yo hold up, since now it's all build-time, we don't need an app/llms.txt/route.ts nor do we need an app/llms-full.txt/route.ts, we can drop those requirements. it's just a simple plugin now in next.config.ts. what other things can we drop?
+
+> drop all the app/ stuff, drop the middleware.ts (in next 16 it's called proxy.ts btw, we don't need it either), drop the stub-manifest smuggling, drop the .next/\**.body/.meta patching, I like the public/ stuff. multimatch is fine keep it. btw if some routes are like, authenticated, we should respect that — only if the user is authenticated can they see the .md. I would *love\* to have dev serving actually, how can we bring that back?
+
+> proxy-matcher auto-exclusion is something we want, this should be plug-n-play. How can we make this work with dynamic pages — i.e. if a page is dynamic and not pre-rendered, can we dynamically do html-to-md using proxy on .md and accept: text/markdown? and the description comes from metadata.description and the title comes from metadata.title right for the links?
+
+> most people deploy to vercel and we need to make sure this works in serverless environments.
+
+> let's keep it simple — if we can use the same mechanism across dev/start/prod let's do that. if we can do codegen that's great, otherwise it's fine to have a simple app/\_llms/[...path]/route.ts or something. I like /\_llms/:path over llms-internal/llms-dynamic.
+
+### Problem
+
+Next.js apps have no first-class way to serve LLM-consumable content: no `/llms.txt` / `/llms-full.txt` (llmstxt.org), no markdown versions of pages (`/about.md`), no `Accept: text/markdown` negotiation. Everyone reimplements markdown rendering by hand, and hand-maintained route lists drift from the real app.
+
+### Outcome
+
+One line in `next.config.ts`. The app then serves `/llms.txt` (index), `/llms-full.txt` (concatenated content), `<route>.md` for every included route, and markdown via Accept negotiation — all derived deterministically from what the pages actually render, with an optional per-page `export const md` for hand-tuned content.
+
+## Shape: `withText()` — the whole product is one config wrapper
+
+```ts
+// next.config.ts — this is the entire integration
+import { withText } from "next-with-text";
+
+export default withText(nextConfig);
+
+// options when needed — one flat object, no per-surface configs
+export default withText(nextConfig, {
+  md: true, // default true — the only surface toggle
+  include: ["**/*"], // route-path globs (not file paths), shared by every surface
+  exclude: [], //   an excluded route is excluded EVERYWHERE: both indexes,
+  //   no public/<route>.md, and the /_llms route 404s it
+  llmstxt: (ctx) => "…", // optional: its return value IS the entire llms.txt body
+});
+```
+
+`llms.txt` and `llms-full.txt` are always generated — no toggles, no per-surface options, no `preamble` string. Anyone wanting a custom index writes the `llmstxt` function; `llms-full.txt` has no customization knobs at all.
+
+### Per-page override: `export const md`
+
+`export const txt` does not exist — there is no `.txt` surface and no `text/plain` negotiation; markdown is the one text representation of a page.
+
+```ts
+type MarkdownContent =
+  | string
+  | { title: string; description: string; content: string }
+
+type MarkdownProps<Route extends string = string> = {
+  params: Promise<…params parsed from Route…>
+  searchParams: Promise<Record<string, string | string[] | undefined>>
+}
+
+type MarkdownPage<Route extends string = string> =
+  | MarkdownContent
+  | ((props: MarkdownProps<Route>) => MarkdownContent | Promise<MarkdownContent>)
+```
+
+- `MarkdownProps<Route>` mirrors Next's generated `PageProps` helper shape-for-shape, with the params type parsed structurally from the route string literal (`MarkdownProps<'/tags/[tag]'>` → `params: Promise<{ tag: string }>`). It can't literally be `PageProps`: that global is constrained to the project's generated `AppRoutes` union, which library code can't name. Both exported, so both styles work: `export const md: MarkdownPage<'/tags/[tag]'> = async ({ params }) => …` and `export async function md({ params }: MarkdownProps<'/tags/[tag]'>) { … }`.
+- Plain values and functions both allowed; functions may be async. Accepting props is optional — a `() => …` function is assignable to the props-taking type.
+- Build-time evaluation passes each route instance's `params` (each `generateStaticParams` instance gets its own call, producing its own `.md`) and a `searchParams` that resolves to `{}` (static output can't depend on the query string). The on-demand `/_llms` tier passes real `params` from the matched route pattern and real `searchParams` from the request URL.
+- **String form:** the string is the page's markdown; index entries keep using rendered metadata.
+- **Object form:** `content` is the page's markdown, and `title`/`description` override the page's entry in both indexes (the curated-index-entry escape hatch — covers "my SEO title reads badly in a link list").
+- Content precedence: `md` export > HTML conversion.
+
+### The `llmstxt` function
+
+```ts
+llmstxt?: (ctx: {
+  title: string
+  description: string
+  routes: { title: string; description: string; href: string }[]
+}) => string
+```
+
+When given, its return value is the entire `llms.txt` body — header, sections, everything. `ctx.title`/`ctx.description` are the auto-derived header values; `ctx.routes` is the flat post-filter, post-auth-exclusion route list with `.md` hrefs and index-entry precedence applied (object-form `md` titles/descriptions already substituted). Grouping is the function's own business. It does not touch `llms-full.txt`. The spec's `## Optional` section has no dedicated support — this function is the escape hatch for spec extras.
+
+### Sections — path-segment convention, depth 1, no config
+
+- Root-level pages are listed directly after the header with no heading.
+- Every other route goes under `## <Section>` derived from its **first** path segment only: `/docs/getting-started`, `/docs/api/auth`, and `/docs/xyz/abc` all land in `## Docs` — nesting beyond depth 1 never creates subsections. (Route-group-derived sections were rejected: layout ≠ taxonomy.)
+- Sections are ordered alphabetically by segment; routes within a section alphabetically by path. Section title prefers the segment index page's rendered bare title (`/docs`'s og:title) when that page exists, else the humanized segment name.
+- A flat site (root pages only) produces a headerless flat list.
+- Applies to the `llms.txt` default template and to `llms-full.txt`'s route ordering; `ctx.routes` stays flat.
+
+### What got dropped, and why it could be (audit of subtractions)
+
+| Dropped                                               | Why it's not needed                                                                                                                                                                                                                                                          |
+| ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `app/llms.txt/route.ts`, `app/llms-full.txt/route.ts` | Outputs are static files written to `public/` by the build-exit hook — no routes to mount                                                                                                                                                                                    |
+| `app/md/[...path]/route.ts`                           | `<route>.md` are plain `public/` files; `next start` serves files added post-build (spike-verified)                                                                                                                                                                          |
+| `middleware.ts` (`proxy.ts` in Next 16)               | Config rewrites support header conditions: `withText` injects a `beforeFiles` rewrite with `has: [{type:"header", key:"accept", value:"(?!.*text/html).*text/markdown.*"}]` → `/:path.md` (spike-verified: markdown-accepting clients get the file, browsers/RSC unaffected) |
+| `lib/llms-txt.ts` / `createLlms`                      | Config lives in `withText`'s options; zero-config defaults cover the rest                                                                                                                                                                                                    |
+| Stub-manifest smuggling                               | The exit hook runs where `withText` was called — it has the options natively                                                                                                                                                                                                 |
+| `.next/**.body` + `.meta` patching                    | Writing `public/` files is platform-neutral and touches no internal formats                                                                                                                                                                                                  |
+| `serverExternalPackages` as a _user concern_          | `withText` sets it internally for the converter (the on-demand route needs the native addon unbundled — WASM build failed under bundling, see spike addendum 5); invisible to users                                                                                          |
+| Sitemap dependency                                    | The built HTML in `.next/server/app` IS the route list (dynamic instances from `generateStaticParams` included)                                                                                                                                                              |
+| `force-static` literals / segment config              | No routes, no segment config                                                                                                                                                                                                                                                 |
+| The sidecar (a brief life)                            | Was: an HTTP server spawned from config load for dev/`next start` on-demand serving. Superseded — the user blessed codegen, so ONE codegen'd route serves on-demand conversion identically in dev, `next start`, and serverless                                              |
+| `export const txt`                                    | No `.txt` surface exists; markdown is the one text representation, so a second export was pure surface area                                                                                                                                                                  |
+| Per-surface configs (`boolean \| options`)            | Shared include/exclude covers real usage; both llms surfaces are always on; the `llmstxt` function is the only index customization anyone needs                                                                                                                              |
+| `preamble` string                                     | The auto-derived header covers the common case; the `llmstxt` function subsumes the rest — a string knob between them was a third way to do the same thing                                                                                                                   |
+| `## Optional` section support                         | Reachable via the `llmstxt` function; not worth a config concept                                                                                                                                                                                                             |
+
+(`multimatch` stays — user call; it's small and battle-tested.)
+
+### Parts
+
+| Part | Mechanism                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| G1   | `withText(nextConfig, opts?)`: during `phase-production-build` registers `process.once("exit")`; when `md` is enabled, injects the Accept-negotiation rewrite into the user's `rewrites()`; passes config through otherwise untouched                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| G2   | Exit hook `spawnSync`s a child Node script (hook must stay sync — `beforeExit` never fires; child can await), passing options via argv/env                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| G2b  | Codegen (all phases, at config load): `withText` writes `app/%5Fllms/[...path]/route.ts` if absent — `%5F` is the URL-encoded underscore, so the URL is `/_llms/:path` (a plain `_llms` folder is routing-private and never mounts — spike-proven gotcha). The generated file is 2 lines (`export { GET } from "next-with-text/route"`), gitignored, idempotent                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| G3   | Child: walk `.next/server/app/**.html` → route list (dynamic instances included); apply the shared include/exclude globs and proxy-matcher auto-exclusion; convert each page (`@xberg-io/html-to-markdown`, sync, ~1.7ms/page, `excludeSelectors: ["footer"]`, absolutize URLs, images as references); write `public/llms.txt`, `public/llms-full.txt`, `public/<route>.md`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| G4   | Auto-header: `# <title>\n\n> <description>` from the built `/` page's head metadata; the `llmstxt` function, when configured, replaces the entire `llms.txt` body (llms-full.txt keeps the auto header regardless)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| G5   | Per-page `md` override: child requires compiled `page.js` (ALS polyfill), walks `routeModule.userland.loaderTree` to the page module, evaluates `md` in any of its forms (spike-proven incl. async) — passing per-instance `params` and empty `searchParams` at build; object form's title/description feed the index entries                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| G6   | llms.txt default template: `# {title}` newline `> {description}` (root metadata; blockquote per llmstxt.org) newline root-level pages as unheaded `- [title](.md url): description` lines, then `## <Section>` groups per the path-segment convention. Link titles/descriptions from each page's rendered metadata (`og:title` preferred over templated `<title>`; `meta[name=description]`) unless object-form `md` overrides. llms-full.txt: auto header + per-page markdown under URL headers in index order, frontmatter stripped inside sections (kept on standalone `.md` files)                                                                                                                                                                                                                                                                                                                                                                                                |
+| G7   | Generated-file hygiene: prune stale outputs on rebuild (manifest of generated paths kept in `.next/cache/` — `next build` wipes the rest of `.next`, and anything in `public/` is served); document gitignore entries for `public/llms*.txt` + generated `.md`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| G8   | Dev serving: same `/_llms` route (G2b/G10) covers dev, where no `public/` files exist — dev rewrites send all surfaces to it; the self-fetch also triggers dev compilation of the page; cookies forward, so authed pages render the requester's view. Spike-verified against `next dev` with zero build artifacts                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| G9   | Auth safety invariant: only prerendered HTML is ever published — auth-gated pages are dynamic (`cookies()`/`headers()`/redirects), produce no build HTML, and are therefore absent from static prod surfaces by construction. **Proxy-matcher auto-exclusion (plug-n-play, default on)**: the exit child reads `.next/server/functions-config-manifest.json` → `functions["/_middleware"].matchers[]` (compiled `regexp` + `originalSource`, spike-verified with a `proxy.ts`; `middleware-manifest.json` stays empty in Next 16 — wrong place to look) and excludes matching routes from all static surfaces                                                                                                                                                                                                                                                                                                                                                                         |
+| G10  | On-demand tier — ONE mechanism for dev / `next start` / serverless: the codegen'd `/_llms/[...path]` route. The injected `afterFiles` rewrites (`/:path(.*\.md)`, `/llms.txt`, `/llms-full.txt` → `/_llms/…`) run after public files, so a static file still wins, but before dynamic routes — a `fallback` rewrite is wrong here because a dynamic route like `/tags/[tag]` matches `/tags/alpha.md` before fallback ever fires (implementation-proven). The handler self-fetches its own origin (`x-forwarded-host`/`host`) with the requester's cookies, converts with the native converter (`withText` sets `serverExternalPackages` internally — the WASM build breaks under bundling: `__dirname`-relative `.wasm` load), honors the shared exclude (excluded routes 404), and passes real `params`/`searchParams` to `md` exports. Verified in all three modes incl. cookie-aware authed markdown and Accept-negotiation chaining (beforeFiles → no file → afterFiles → route) |
+
+## Requirements (R)
+
+| ID  | Requirement                                                                                                                                                                                                                                                      | Status    |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| R0  | `withText()` alone makes the app serve spec-compliant `/llms.txt`, `/llms-full.txt`, `<route>.md` for every included route, and `Accept: text/markdown` negotiation                                                                                              | Core goal |
+| R1  | Route selection via gitignore-style include/exclude globs matched against **route paths**, not file paths — one shared list applied to every surface, including the on-demand route (excluded ⇒ excluded everywhere)                                             | Must-have |
+| R2  | Zero-config default (auto-header from rendered root metadata; discovery from build output; globs `**`); a single `md` surface toggle; per-page `export const md` overrides in all `MarkdownPage` forms, object form curating the index entry                     | Must-have |
+| R3  | Everything inside `next build`; no extra build steps; generated artifacts limited to `public/` outputs + ONE codegen'd gitignored route (`app/%5Fllms/…`, user-blessed)                                                                                          | Must-have |
+| R4  | All content derived from what pages actually render (incl. `generateMetadata`): entries as `[title](url): description`, full page content as markdown                                                                                                            | Core goal |
+| R5  | One mechanism everywhere: static files at build + the codegen'd `/_llms` route for on-demand — identical behavior in dev, `next start`, and serverless; zero user files                                                                                          | Must-have |
+| R6  | Dynamic routes (`/blog/[slug]`) appear as concrete URLs — instances present in build output via `generateStaticParams`, each instance's `params` passed to its `md` call; on-demand-only paths out of scope for the index                                        | Must-have |
+| R7  | Verifiable via `bun test` against a fixture app — no real deploy needed                                                                                                                                                                                          | Must-have |
+| R8  | Authenticated content never leaks: auth-gated (dynamic) pages absent from static surfaces by construction; proxy-matcher auto-exclusion is plug-n-play (default on); on-demand tier forwards cookies so `.md` of an authed page renders the requester's own view | Must-have |
+| R9  | Dynamic (non-prerendered) pages get `.md` + Accept negotiation via on-demand conversion — zero user files on every target including serverless; real `searchParams` reach `md` exports there                                                                     | Must-have |
+| R10 | Index customization (`llmstxt`) affects only `llms.txt`; no header/preamble content ever appears in any `.md` output                                                                                                                                             | Must-have |
+
+## Fit Check (R × G)
+
+| Req | Requirement                                                              | Status    | G   |
+| --- | ------------------------------------------------------------------------ | --------- | --- |
+| R0  | All four surfaces from `withText()` alone                                | Core goal | ✅  |
+| R1  | One shared include/exclude, enforced everywhere                          | Must-have | ✅  |
+| R2  | Zero-config; `md` toggle; `MarkdownPage` overrides                       | Must-have | ✅  |
+| R3  | Inside `next build`; public/ artifacts + one gitignored route            | Must-have | ✅  |
+| R4  | Content from rendered HTML                                               | Must-have | ✅  |
+| R5  | One mechanism across dev / start / serverless                            | Must-have | ✅  |
+| R6  | Dynamic routes as concrete URLs, per-instance `params`                   | Must-have | ✅  |
+| R7  | Verifiable via `bun test`                                                | Must-have | ✅  |
+| R8  | Auth never leaks; auto-exclusion plug-n-play; cookie-aware on-demand     | Must-have | ✅  |
+| R9  | Dynamic pages on-demand everywhere, real `searchParams`, zero user files | Must-have | ✅  |
+| R10 | `llmstxt` touches only `llms.txt`; `.md` outputs never carry the header  | Must-have | ✅  |
+
+All load-bearing mechanisms are spike-verified (`spike-build-time-extraction.md`): exit-hook timing, converter fidelity + metadata, public-file serving of post-build writes, header-conditional rewrite negotiation, compiled-page override evaluation, the `/_llms` route in all three modes. Residual implementation risks (not shape risks): Vercel's post-build collection of `public/` additions (structurally expected, untested on a real deploy); `output: "standalone"` copies `public/` during build — possibly before the exit hook, so the hook may need to mirror writes into `.next/standalone`; stale-output pruning (G7).
+
+## Verifier
+
+Status: **implemented and passing** (2026-08-06) — `bun run test` runs `tests/next-with-text.test.ts`: 34 pass / 0 fail; nice-to-have check 26 (`md: false`) verified manually.
+
+### Fixture (`tests/fixtures/next`)
+
+A minimal App Router app (Next 16.3, scaffolded during the spike). **No user integration files besides `next.config.ts`** — no hand-written route handlers, no middleware/proxy integration for llms, no config module. `next.config.ts` wraps with `withText(nextConfig, { exclude: ["/docs/internal/**"] })` typed as `WithTextOptions` (the library exports `MarkdownPage` and `WithTextOptions`), plus suite-driven env branches: `LLMSTXT_FN=1` adds an `llmstxt` function emitting `LLMSTXT_FN:{title}:{description}` + one `ROUTE:{title}|{href}|{description}` line per route (the exit-hook child must be able to reach this function, e.g. by loading the user's next config itself); `MD_OFF=1` sets `md: false`.
+
+Every page has metadata (title + description) and a known sentinel sentence in its body. Root layout metadata: title "Fixture Site", description "A test site." (feeds the auto-derived header).
+
+| Route                    | Probes                                                                                                                                                                                                                                                                                                                                                              |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/`                      | Root metadata for the auto-header                                                                                                                                                                                                                                                                                                                                   |
+| `/about`                 | List + code block; string-function form: `md: MarkdownPage` returning `MD_OVERRIDE_ABOUT`                                                                                                                                                                                                                                                                           |
+| `/plain`                 | Plain-value object form: `md: MarkdownPage = { title: "MD_TITLE_PLAIN", description: "MD_DESC_PLAIN", content: "MD_CONTENT_PLAIN…" }`                                                                                                                                                                                                                               |
+| `/docs/getting-started`  | `<img src="/images/team.png">` — the image-conversion probe                                                                                                                                                                                                                                                                                                         |
+| `/docs/api/auth`         | Plain converted page at depth 2                                                                                                                                                                                                                                                                                                                                     |
+| `/docs/api/tokens`       | Async object form: `md: MarkdownPage = async () => ({ title: "MD_TITLE_TOKENS", description: "MD_DESC_TOKENS", content: "MD_CONTENT_TOKENS…" })`, with deliberately different rendered metadata (`OG_TITLE_TOKENS`)                                                                                                                                                 |
+| `/docs/internal/secrets` | Excluded via config (`SENTINEL_SECRETS` must appear nowhere)                                                                                                                                                                                                                                                                                                        |
+| `/blog/[slug]`           | `generateStaticParams` → `/blog/hello`, `generateMetadata`; **no** `md` export — the HTML-conversion + `generateMetadata` probe                                                                                                                                                                                                                                     |
+| `/tags/[tag]`            | `generateStaticParams` → `alpha`, `beta`; params-consuming function declaration: `export async function md({ params }: MarkdownProps<"/tags/[tag]">) { return \`MD*TAG*${(await params).tag}…\` }`— string-returning, so index entries still come from`generateMetadata`(also the regression probe for the`MarkdownProps` export and function-declaration scanning) |
+| `/zebra`                 | Plain page (ordering probe)                                                                                                                                                                                                                                                                                                                                         |
+| `/account`               | Reads `cookies()`, renders `session=<cookie value\|none>` → dynamic; the auth/on-demand probe (`SENTINEL_ACCOUNT`)                                                                                                                                                                                                                                                  |
+| `/admin`                 | Static but guarded by `proxy.ts` with `matcher: ["/admin/:path*"]` — the auto-exclusion probe                                                                                                                                                                                                                                                                       |
+| `/echo`                  | Page component reads `searchParams` → dynamic; `md: MarkdownPage<"/echo"> = async ({ searchParams }) => \`MD*ECHO*${q ?? "none"}…\``— the on-demand`searchParams` probe                                                                                                                                                                                             |
+
+### Checks
+
+Run `bun test`. The suite runs `next build` on the fixture, inspects the generated files, then starts `next start` on a free port and asserts over HTTP. Checks 15 and 26 involve alternate builds.
+
+1. **Build outputs:** after `next build`, `public/` contains `llms.txt`, `llms-full.txt`, and one `.md` per included prerendered page (`index.md` for `/`, `about.md`, `plain.md`, `zebra.md`, `docs/getting-started.md`, `docs/api/auth.md`, `docs/api/tokens.md`, `blog/hello.md`, `tags/alpha.md`, `tags/beta.md`) — generated inside the build, no separate step. `docs/internal/secrets.md` is absent (shared exclude).
+2. **Template:** `GET /llms.txt` → 200 text; body is `# Fixture Site`, then `> A test site.` (auto-derived from root metadata), then the sectioned links per the path-segment convention.
+3. **Index entries:** every included page appears as `- [<title>](<.md url>): <description>` — titles/descriptions from rendered metadata (`og:title` preferred over the templated `<title>`; `/blog/hello`'s from `generateMetadata`), never humanized slugs; links point at `.md` URLs; `/blog/hello` present as a concrete URL.
+4. **llms-full.txt:** `GET /llms-full.txt` → 200; auto-derived header, then full content blocks (md-export or converted HTML) for every included route in index order; excluded (`/docs/internal/**`) and auth-excluded (`/account`, `/admin`) content absent.
+5. **Conversion cleanliness:** `llms-full.txt` sections contain each included page's sentinel as markdown — no HTML tags, no RSC payload residue, no per-section frontmatter blocks.
+6. **String-function override:** `GET /about.md` serves `MD_OVERRIDE_ABOUT` (the `md` export wins over HTML conversion), and the `/about` section of `llms-full.txt` uses the override too.
+7. **Zero-config `.md` coverage:** `GET /docs/getting-started.md` and `GET /zebra.md` → 200 markdown with the page's sentinel; `GET /nonexistent.md` → 404.
+8. **Accept negotiation** via the injected rewrite (no middleware/proxy integration file exists beyond the fixture's own auth `proxy.ts`): `GET /docs/getting-started` with `Accept: text/markdown` → markdown; with a browser-like Accept containing `text/html` → normal HTML.
+9. **Images:** the `/docs/getting-started` image appears as a markdown reference with an absolute URL — no `data:` URIs anywhere in any output.
+10. **Hermetic:** the suite needs no network beyond localhost and no deploy credentials.
+11. **Auth safety (dynamic):** `/account` is absent from `llms.txt` and `llms-full.txt`, has no `public/account.md`, and `SENTINEL_ACCOUNT` appears in no generated file.
+12. **Proxy-matcher auto-exclusion (plug-n-play):** `/admin` is statically prerendered, yet absent from both indexes and has no `public/admin.md` — solely because `proxy.ts`'s matcher covers it; no exclude glob is configured for it.
+13. **On-demand tier (`next start`):** `GET /account.md` → 200 markdown containing `session=none`; with `Cookie: session=abc123` → contains `session=abc123` (cookie-aware conversion of a dynamic page via the codegen'd `/_llms` route); `Accept: text/markdown` on `/account` behaves the same.
+14. **Dev serving via the same route:** against a `next dev` server (no build artifacts), `GET /llms.txt` returns the index, `GET /about.md` returns markdown, and `Accept: text/markdown` on `/docs/getting-started` returns markdown — no user files besides `next.config.ts` (and the fixture's own `proxy.ts`).
+15. **Retired slot** — was the per-surface toggle check; the flat options left `md` as the only toggle, covered by check 26. Kept numbered so check numbers stay aligned with the test suite.
+16. **Hygiene** (nice-to-have): removing a page and rebuilding prunes its stale `.md` from `public/`.
+17. **Object form, content:** `GET /docs/api/tokens.md` → `MD_CONTENT_TOKENS`; the tokens block in `llms-full.txt` uses it too.
+18. **Object form, index entry:** `llms.txt`'s `## Docs` section lists `- [MD_TITLE_TOKENS](/docs/api/tokens.md): MD_DESC_TOKENS` — not `OG_TITLE_TOKENS`. String-form pages (`/about`) still use rendered metadata for their entries.
+19. **Plain-value form:** `GET /plain.md` → `MD_CONTENT_PLAIN`; its root-list entry uses `MD_TITLE_PLAIN`/`MD_DESC_PLAIN`.
+20. **No txt surface:** no `public/**/*.txt` besides `llms.txt`/`llms-full.txt`; `GET /about.txt` → 404; `GET /about` with `Accept: text/plain` → normal HTML.
+21. **Sections:** with no `llmstxt` function, `llms.txt` shows root pages (`/`, `/about`, `/plain`, `/zebra`) unheaded, then `## Blog` (`/blog/hello`), `## Docs` (`/docs/api/auth`, `/docs/api/tokens`, `/docs/getting-started` — depth-2 routes flattened into `## Docs`), and `## Tags` (`/tags/alpha`, `/tags/beta`), sections and entries alphabetical; `/docs/internal/**`, `/account`, `/admin`, `/echo` (dynamic) absent.
+22. **Shared exclude everywhere:** `SENTINEL_SECRETS` appears in no generated file and `GET /docs/internal/secrets.md` → 404 in `next start` **and** dev (the `/_llms` route honors exclude).
+23. **`llmstxt` function:** building with `LLMSTXT_FN=1` produces exactly the function's return as the `llms.txt` body; the sentinel render shows the auto-derived title/description and the flat `routes` with `.md` hrefs and `MD_TITLE_TOKENS` substituted; `llms-full.txt` is unaffected.
+24. **Build-time `params`:** `public/tags/alpha.md` contains `MD_TAG_alpha` and `public/tags/beta.md` contains `MD_TAG_beta` — one function call per `generateStaticParams` instance, each receiving its own `params`.
+25. **On-demand `searchParams`:** `GET /echo.md?q=xyz` → contains `MD_ECHO_xyz`; `GET /echo.md` → `MD_ECHO_none`. Works in `next start` and dev; `/echo` is dynamic so no `public/echo.md` exists.
+26. **`md: false`** (nice-to-have): building with `MD_OFF=1` produces no `.md` files and no Accept-negotiation or `.md` on-demand rewrites; both llms surfaces still generated, index hrefs pointing at canonical page URLs instead of `.md`.
+
+Required: 1–14 and 17–25. Nice-to-have: 16, 26. Verdict: PASS only if every Required check holds. Report per-check pass/fail each run.
+
+## Shape history (audit trail)
+
+- **A: next.config plugin + codegen** — rejected: generated route files in `app/`, config-bound preamble.
+- **B (build-time handlers) / C (request-time self-fetch) / D (build-hook emission) / E (B + shared config)** — superseded stages; C survives conceptually in the on-demand route's self-fetch, D's "emit files at build" instinct ultimately won in G's form.
+- **F: shared config + handlers + HTML→md engine** — proved the engine, exit-hook timing, and middleware negotiation; then every user-facing file was subtracted: config object → mount options → nothing; route handlers → public files; middleware → config rewrites. G is F minus all user files.
+- **G, initial cut** — per-surface `boolean | options` toggles, a `preamble` string, `export const txt` alongside `md`. Implemented and passing (18/18, 2026-08-06).
+- **G, post-research revision (2026-08-06)** — studying the npm-name incumbent prompted a simplification pass. The only two ideas it had worth keeping were spec-shaped `## Section` grouping and a per-page override of the _index entry_ (title/description) independent of page content; we adopted both in subtracted form — sections as a zero-config path-segment convention, the index-entry override folded into object-form `md` instead of a second export. In the same pass: `txt` deleted, options flattened to `{ md, include, exclude, llmstxt }` with one shared exclude enforced everywhere, `preamble` replaced by the all-or-nothing `llmstxt` function (which also covers the incumbent's custom-`generator` and `## Optional` use cases), publish name settled as `next-with-text`. Its failure modes hardened our requirements: source-scanning breaks on serverless (we walk build output), route-group skipping and `[slug]` literals miss real routes (build output resolves both), static-only metadata extraction can't see `generateMetadata` (we read rendered HTML), and gated-page metadata leaking into its index sharpened R8.
+- Key empirical facts that must not be re-litigated: in-prerender HTML reads are unsound (zero HTML at handler time; polling starves same-worker paths); `beforeExit` never fires in `next build` (`process.exit()`), so exit-hook work is sync + `spawnSync` child for async needs; a plain `_llms` folder never mounts (`%5F` escape required); the WASM converter breaks under bundling.
+
+## Next
+
+Real-deploy check (Vercel + standalone) — the remaining risks are operational, not shape: post-build `public/` collection on Vercel, standalone's `public/` copy order, both untested on a real deploy.
