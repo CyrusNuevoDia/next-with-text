@@ -1,9 +1,8 @@
 import { existsSync, readdirSync } from "node:fs"
 import { join } from "node:path"
-import { convert } from "@xberg-io/html-to-markdown"
 import {
-  CONVERT_OPTIONS,
   compareCodeUnits,
+  convertHTML,
   discoverBuiltRoutes,
   evaluateMd,
   isPageFile,
@@ -79,7 +78,7 @@ export function createHandler(options: RouteOptions, loaders: Loaders = {}) {
         : respond(stubFor(route, override, options.md), "text/markdown")
     }
     return respond(
-      convert(html, CONVERT_OPTIONS).content ?? "",
+      convertHTML(html).content ?? "",
       "text/markdown",
       cookie !== null
     )
@@ -202,7 +201,7 @@ async function serveSurface(
           if (html === null) {
             return declared
           }
-          const result = convert(html, CONVERT_OPTIONS)
+          const result = convertHTML(html)
           const rendered = pageMeta(result.metadata)
           return {
             content: publishedBody(override, result.content),
@@ -306,7 +305,7 @@ async function siteMeta(
   const html = await fetchPage(origin, "/", null)
   return html === null
     ? { description: "", title: "" }
-    : pageMeta(convert(html, CONVERT_OPTIONS).metadata)
+    : pageMeta(convertHTML(html).metadata)
 }
 
 async function fetchPage(

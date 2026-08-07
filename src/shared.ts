@@ -1,8 +1,15 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs"
 import { join, relative, sep } from "node:path"
-import type { HtmlMetadata } from "@xberg-io/html-to-markdown"
+import {
+  type ConversionResult,
+  convert,
+  type HtmlMetadata,
+} from "@xberg-io/html-to-markdown"
 import multimatch from "multimatch"
 
+const IMAGE_TAG = /<img\b[^>]*>/gi
+const SRC_ATTRIBUTE = /\ssrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i
+const DATA_URL = /^data:/i
 const WORD_SEPARATOR = /[-_]/
 
 // The md export is the page's entire published text. A `content` publishes a
@@ -342,6 +349,18 @@ export function matchPattern(
 }
 
 export const CONVERT_OPTIONS = { excludeSelectors: ["footer"] }
+
+export function convertHTML(html: string): ConversionResult {
+  return convert(stripPathlessImages(html), CONVERT_OPTIONS)
+}
+
+function stripPathlessImages(html: string): string {
+  return html.replace(IMAGE_TAG, (image) => {
+    const src = image.match(SRC_ATTRIBUTE)
+    const path = src?.[1] ?? src?.[2] ?? src?.[3]
+    return path && !DATA_URL.test(path) ? image : ""
+  })
+}
 
 export function compareCodeUnits(a: string, b: string): number {
   if (a < b) {

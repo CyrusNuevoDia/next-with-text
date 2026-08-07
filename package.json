@@ -1,6 +1,6 @@
 {
   "name": "next-with-text",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "One-line llms.txt, llms-full.txt, and per-page markdown for Next.js",
   "keywords": [
     "next",

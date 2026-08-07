@@ -255,6 +255,8 @@ describe("next dev", () => {
     const body = await res.text()
     expect(body).toContain("SENTINEL_GETTING_STARTED")
     expect(body).toContain("![The team](/images/team.png)")
+    expect(body).not.toContain("Inline avatar")
+    expect(body).not.toContain("Missing source")
     expect(body).not.toContain("<article")
     expect(body).not.toContain("data:image")
   })
@@ -552,9 +554,10 @@ describe("next build", () => {
   })
 
   test("check 9 (amended): image references are real URLs, no data: URIs anywhere", () => {
-    expect(read("docs/getting-started.md")).toContain(
-      "![The team](/images/team.png)"
-    )
+    const page = read("docs/getting-started.md")
+    expect(page).toContain("![The team](/images/team.png)")
+    expect(page).not.toContain("Inline avatar")
+    expect(page).not.toContain("Missing source")
     for (const rel of GENERATED) {
       expect(read(rel)).not.toContain("data:image")
     }

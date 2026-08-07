@@ -15,10 +15,9 @@ import {
 } from "node:fs"
 import { createRequire } from "node:module"
 import { dirname, join } from "node:path"
-import { convert } from "@xberg-io/html-to-markdown"
 import {
-  CONVERT_OPTIONS,
   compareCodeUnits,
+  convertHTML,
   discoverBuiltRoutes,
   discoverModuleRoutes,
   evaluateMd,
@@ -212,7 +211,7 @@ async function buildPage(
   }
   const result = gated
     ? null
-    : convert(readFileSync(htmlPath(serverApp, route), "utf8"), CONVERT_OPTIONS)
+    : convertHTML(readFileSync(htmlPath(serverApp, route), "utf8"))
   const rendered = result
     ? pageMeta(result.metadata)
     : { description: "", title: "" }
