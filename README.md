@@ -42,6 +42,8 @@ export default withText(nextConfig, {
   // no .md file, and the on-demand route 404s them
   llmstxt: (ctx) => "…", // optional: its return value IS the entire llms.txt body
   // ctx is { title, description, sections: [{ title, routes: [{ title, description, href }] }] }
+  llmsfulltxt: (ctx) => "…", // optional: owns llms-full.txt with the same ctx shape
+  // every route in llmsfulltxt also has its finalized publishable content
 });
 ```
 
@@ -136,7 +138,29 @@ llmstxt: ({ title, description, sections }) =>
     .join("\n");
 ```
 
-`sections` is the final route list, grouped the way the default index groups it — filtered, auth-excluded, with any `md` overrides applied. The first section has an empty `title`: those are the root-level pages the index opens with, before any heading. A section is only present when it has routes, so you never have to guard against empty ones. Regroup them however you like; this only affects `llms.txt`, and `llms-full.txt` has no knobs.
+`sections` is the final route list, grouped the way the default index groups it — filtered, auth-excluded, with any `md` overrides applied. The first section has an empty `title`: those are the root-level pages the index opens with, before any heading. A section is only present when it has routes, so you never have to guard against empty ones. Regroup them however you like; this only affects `llms.txt`.
+
+### Custom full text: the `llmsfulltxt` function
+
+The full-text callback mirrors `llmstxt`: it owns the whole file and receives the same title, description, sections, route grouping, and ordering. Each route also carries its finalized `content`:
+
+```ts
+llmsfulltxt: ({ title, description, sections }) =>
+  [
+    `# ${title}`,
+    `> ${description}`,
+    ...sections.flatMap((section) => [
+      section.title && `## ${section.title}`,
+      ...section.routes.map(
+        (route) => `${route.content}\n\n[Source](${route.href})`
+      ),
+    ]),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+```
+
+`content` is exactly what the default `llms-full.txt` would publish for that route: frontmatter is removed, `md` content overrides rendered HTML, gated opt-ins become safe stubs, and excluded or non-publishable routes never reach the callback.
 
 ## Generated files clean up after themselves
 

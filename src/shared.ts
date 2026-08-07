@@ -72,9 +72,23 @@ export type LlmstxtContext = {
   title: string
 }
 
+export type LlmsFulltxtLink = LlmstxtLink & { content: string }
+
+export type LlmsFulltxtSection = {
+  routes: LlmsFulltxtLink[]
+  title: string
+}
+
+export type LlmsFulltxtContext = {
+  description: string
+  sections: LlmsFulltxtSection[]
+  title: string
+}
+
 export type WithTextOptions = {
   exclude?: string[]
   include?: string[]
+  llmsfulltxt?: (ctx: LlmsFulltxtContext) => string
   llmstxt?: (ctx: LlmstxtContext) => string
   md?: boolean
 }
@@ -218,6 +232,27 @@ export function llmstxtSections(
     href: linkHref(link.route, mdEnabled),
     title: link.title,
   })
+  return groupedSections(links, entry)
+}
+
+export function llmsfulltxtSections(
+  links: Link[],
+  mdEnabled: boolean,
+  content: (link: Link) => string
+): LlmsFulltxtSection[] {
+  const entry = (link: Link): LlmsFulltxtLink => ({
+    content: content(link),
+    description: link.description,
+    href: linkHref(link.route, mdEnabled),
+    title: link.title,
+  })
+  return groupedSections(links, entry)
+}
+
+function groupedSections<Route>(
+  links: Link[],
+  entry: (link: Link) => Route
+): Array<{ routes: Route[]; title: string }> {
   const { root, sections } = groupLinks(links)
   return [
     { routes: root.map(entry), title: "" },

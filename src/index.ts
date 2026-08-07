@@ -24,6 +24,7 @@ import {
 const moduleDir = dirname(require.resolve("next-with-text"))
 
 export type {
+  LlmsFulltxtContext,
   LlmstxtContext,
   MarkdownContent,
   MarkdownPage,
@@ -58,6 +59,7 @@ let patchRegistered = false
 let devCleanupRegistered = false
 
 type Capture = {
+  llmsfulltxt?: WithTextOptions["llmsfulltxt"]
   llmstxt?: WithTextOptions["llmstxt"]
 }
 
@@ -73,13 +75,14 @@ export function withText(
         ? await nextConfig(phase, ctx)
         : nextConfig
 
-    // The build-exit child re-loads this config to reach the llmstxt function
-    // (it can't cross the process boundary as JSON) — hand it over and do
+    // The build-exit child re-loads this config to reach the template functions
+    // (they can't cross the process boundary as JSON) — hand them over and do
     // nothing else in that pass, or the child would re-register the exit hook
     // and recurse.
     const capture = (globalThis as { __NEXT_WITH_TEXT_CAPTURE__?: Capture })
       .__NEXT_WITH_TEXT_CAPTURE__
     if (capture) {
+      capture.llmsfulltxt = options.llmsfulltxt
       capture.llmstxt = options.llmstxt
       return base
     }
@@ -108,6 +111,7 @@ export function withText(
       patchRegistered = true
       const payload = {
         dir,
+        hasLlmsfulltxt: typeof options.llmsfulltxt === "function",
         hasLlmstxt: typeof options.llmstxt === "function",
         options: resolved,
       }

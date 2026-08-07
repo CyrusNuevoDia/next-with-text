@@ -22,7 +22,9 @@ import {
   discoverModuleRoutes,
   evaluateMd,
   type Link,
+  type LlmsFulltxtContext,
   type LlmstxtContext,
+  llmsfulltxtSections,
   llmstxtSections,
   matchesRoute,
   orderLinks,
@@ -42,6 +44,7 @@ const MANIFEST = "next-with-text-manifest.json"
 
 type Payload = {
   dir: string
+  hasLlmsfulltxt: boolean
   hasLlmstxt: boolean
   options: ResolvedOptions
 }
@@ -60,7 +63,12 @@ main(payload).catch((err) => {
   console.error("[next-with-text] generation failed:", err)
 })
 
-async function main({ dir, options, hasLlmstxt }: Payload): Promise<void> {
+async function main({
+  dir,
+  options,
+  hasLlmsfulltxt,
+  hasLlmstxt,
+}: Payload): Promise<void> {
   const serverApp = join(dir, ".next", "server", "app")
   if (!(existsSync(join(dir, ".next", "BUILD_ID")) && existsSync(serverApp))) {
     return
@@ -101,7 +109,15 @@ async function main({ dir, options, hasLlmstxt }: Payload): Promise<void> {
     route: page.route,
     ...page.meta,
   }))
-  const writes = await buildWrites(dir, options, hasLlmstxt, pages, site, links)
+  const writes = await buildWrites(
+    dir,
+    options,
+    hasLlmsfulltxt,
+    hasLlmstxt,
+    pages,
+    site,
+    links
+  )
 
   const publicDir = join(dir, "public")
   // The public/ tier is a deploy artifact: local builds skip it (the on-demand
@@ -134,6 +150,7 @@ async function main({ dir, options, hasLlmstxt }: Payload): Promise<void> {
 async function buildWrites(
   dir: string,
   options: ResolvedOptions,
+  hasLlmsfulltxt: boolean,
   hasLlmstxt: boolean,
   pages: Page[],
   site: PageMeta,
@@ -152,13 +169,13 @@ async function buildWrites(
         return [[rel, content]]
       })
     : []
-  // the llmstxt function can't cross into this process as JSON — re-load the
-  // user's next config (capture mode) to reach it; its return IS the file body
-  const llmstxt = hasLlmstxt ? await loadLlmstxt(dir) : undefined
+  // Functions can't cross into this process as JSON — re-load the user's next
+  // config in capture mode to reach them; each return IS its entire file body.
+  const templates = hasLlmstxt || hasLlmsfulltxt ? await loadTemplates(dir) : {}
   writes.push([
     "llms.txt",
-    llmstxt
-      ? llmstxt({
+    templates.llmstxt
+      ? templates.llmstxt({
           description: site.description,
           sections: llmstxtSections(links, options.md),
           title: site.title,
@@ -166,17 +183,21 @@ async function buildWrites(
       : renderIndex(site, links, options.md),
   ])
   const byRoute = new Map(pages.map((page) => [page.route, page]))
+  const content = (link: Link) => {
+    const pageContent = byRoute.get(link.route)?.content
+    return pageContent === null || pageContent === undefined
+      ? renderStub(link, options.md)
+      : stripFrontmatter(pageContent).trim()
+  }
   writes.push([
     "llms-full.txt",
-    renderFull(
-      site,
-      orderLinks(links).map((link) => {
-        const content = byRoute.get(link.route)?.content
-        return content === null || content === undefined
-          ? renderStub(link, options.md)
-          : stripFrontmatter(content).trim()
-      })
-    ),
+    templates.llmsfulltxt
+      ? templates.llmsfulltxt({
+          description: site.description,
+          sections: llmsfulltxtSections(links, options.md, content),
+          title: site.title,
+        })
+      : renderFull(site, orderLinks(links).map(content)),
   ])
   return writes
 }
@@ -366,11 +387,14 @@ function locatePageModule(
 
 // Re-runs the user's next config through Next's own loader (which handles TS
 // transpilation) with the capture global set: withText sees it, hands over the
-// llmstxt function, and skips all side effects in that pass.
-async function loadLlmstxt(
-  dir: string
-): Promise<((ctx: LlmstxtContext) => string) | undefined> {
-  const capture: { llmstxt?: unknown } = {}
+// template functions, and skips all side effects in that pass.
+type Templates = {
+  llmsfulltxt?: (ctx: LlmsFulltxtContext) => string
+  llmstxt?: (ctx: LlmstxtContext) => string
+}
+
+async function loadTemplates(dir: string): Promise<Templates> {
+  const capture: { llmsfulltxt?: unknown; llmstxt?: unknown } = {}
   ;(globalThis as Record<string, unknown>).__NEXT_WITH_TEXT_CAPTURE__ = capture
   try {
     const requireFrom = createRequire(join(dir, "package.json"))
@@ -382,14 +406,22 @@ async function loadLlmstxt(
       dir: string
     ) => Promise<unknown>
     await loadConfig("phase-production-build", dir)
-    return typeof capture.llmstxt === "function"
-      ? (capture.llmstxt as (ctx: LlmstxtContext) => string)
-      : undefined
+    return {
+      llmsfulltxt:
+        typeof capture.llmsfulltxt === "function"
+          ? (capture.llmsfulltxt as (ctx: LlmsFulltxtContext) => string)
+          : undefined,
+      llmstxt:
+        typeof capture.llmstxt === "function"
+          ? (capture.llmstxt as (ctx: LlmstxtContext) => string)
+          : undefined,
+    }
   } catch (err) {
     console.error(
-      "[next-with-text] failed to load the llmstxt function from next.config:",
+      "[next-with-text] failed to load template functions from next.config:",
       err
     )
+    return {}
   } finally {
     ;(globalThis as Record<string, unknown>).__NEXT_WITH_TEXT_CAPTURE__ =
       undefined

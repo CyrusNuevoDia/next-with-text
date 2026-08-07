@@ -811,6 +811,41 @@ describe("llmstxt function build", () => {
   })
 })
 
+describe("llmsfulltxt function build", () => {
+  beforeAll(async () => {
+    cleanFixture()
+    await buildFixture({ LLMSFULLTXT_FN: "1" })
+  })
+
+  test("its return owns llms-full.txt and routes carry finalized content", () => {
+    const body = readFileSync(join(PUBLIC, "llms-full.txt"), "utf8")
+    expect(body).toStartWith("LLMSFULLTXT_FN:Fixture Site:A test site.")
+    expect(body).toContain(
+      "ROUTE:MD_TITLE_TOKENS|/docs/api/tokens.md|MD_DESC_TOKENS|MD_CONTENT_TOKENS"
+    )
+    expect(body).not.toContain("SENTINEL_TOKENS")
+    expect(body).not.toContain("meta-description:")
+  })
+
+  test("its sections mirror llmstxt grouping and contain only publishable routes", () => {
+    const body = readFileSync(join(PUBLIC, "llms-full.txt"), "utf8")
+    expect(
+      body.split("\n").filter((line) => line.startsWith("SECTION:"))
+    ).toEqual([
+      "SECTION:",
+      "SECTION:Admin",
+      "SECTION:Blog",
+      "SECTION:Docs",
+      "SECTION:Tags",
+    ])
+    expect(body).toContain("ROUTE:MD_TITLE_GATED|/gated.md|MD_DESC_GATED|")
+    expect(body).toContain("[Requires session](/gated.md)")
+    expect(body).not.toContain("/account.md")
+    expect(body).not.toContain("/admin.md")
+    expect(body).not.toContain("/docs/internal/")
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Local builds — no deploy env (CI/VERCEL unset): the static tier is skipped,
 // leftovers from earlier deploy builds are pruned, and next start serves every
