@@ -1,7 +1,7 @@
 {
   "name": "next-with-text",
-  "version": "0.2.0",
-  "description": "llms.txt, llms-full.txt, and per-page markdown for Next.js — one line in next.config.ts",
+  "version": "0.2.1",
+  "description": "One-line llms.txt, llms-full.txt, and per-page markdown for Next.js",
   "keywords": [
     "next",
     "nextjs",
