@@ -14,6 +14,7 @@ export default withText(nextConfig);
 ```
 
 ```gitignore
+# .gitignore
 **/app/%5Fllms/
 ```
 
