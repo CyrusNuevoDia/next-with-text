@@ -19,6 +19,7 @@ import {
 } from "bun:test"
 import {
   existsSync,
+  mkdirSync,
   readdirSync,
   readFileSync,
   rmSync,
@@ -356,6 +357,7 @@ describe("next build", () => {
     cleanFixture()
     // what an earlier build would have left at a route that now publishes no
     // body — it must be reclaimed, or it shadows the live per-requester render
+    mkdirSync(PUBLIC, { recursive: true })
     writeFileSync(join(PUBLIC, "gated.md"), "STALE_GATED: captured render\n")
     await buildFixture({
       NEXT_ADAPTER_PATH: join(FIXTURE, "adapter-probe.cjs"),
