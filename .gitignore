@@ -1,0 +1,47 @@
+# dependencies (bun install)
+node_modules
+
+# output
+out
+dist
+*.tgz
+
+# code coverage
+coverage
+*.lcov
+
+# logs
+logs
+_.log
+report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
+
+# dotenv environment variable files
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+
+# next.js build output (test fixture) — fixture *source* stays tracked, the verifier needs it
+.next
+next-env.d.ts
+exit-probe.jsonl
+
+# generated llms surfaces in the fixture's public dir (written by the build-exit hook)
+tests/fixtures/next/public/llms.txt
+tests/fixtures/next/public/llms-full.txt
+tests/fixtures/next/public/**/*.md
+
+# codegen'd on-demand route (written by withText at config load)
+tests/fixtures/next/app/%5Fllms/
+
+# caches
+.eslintcache
+.cache
+*.tsbuildinfo
+
+# IntelliJ based IDEs
+.idea
+
+# Finder (MacOS) folder config
+.DS_Store
