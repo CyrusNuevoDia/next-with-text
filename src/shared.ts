@@ -352,7 +352,8 @@ export function matchPattern(
 export const CONVERT_OPTIONS = { excludeSelectors: ["footer"] }
 
 export function convertHTML(html: string): ConversionResult {
-  return convert(stripInlineImages(html), CONVERT_OPTIONS)
+  const result = convert(stripInlineImages(html), CONVERT_OPTIONS)
+  return { ...result, content: selectFrontmatter(result.content ?? "") }
 }
 
 function stripInlineImages(html: string): string {
@@ -361,6 +362,25 @@ function stripInlineImages(html: string): string {
     const path = src?.[1] ?? src?.[2] ?? src?.[3]
     return path && !DATA_URL.test(path) ? image : ""
   })
+}
+
+function selectFrontmatter(markdown: string): string {
+  if (!markdown.startsWith("---\n")) {
+    return markdown
+  }
+  const end = markdown.indexOf("\n---\n", 3)
+  if (end === -1) {
+    return markdown
+  }
+  const lines = markdown.slice(4, end).split("\n")
+  const selected = [
+    lines.find((line) => line.startsWith("title:")),
+    lines.find((line) => line.startsWith("meta-description:")),
+  ].filter((line): line is string => line !== undefined)
+  const body = markdown.slice(end + 5)
+  return selected.length === 0
+    ? body
+    : `---\n${selected.join("\n")}\n---\n${body}`
 }
 
 export function compareCodeUnits(a: string, b: string): number {

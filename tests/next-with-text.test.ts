@@ -262,6 +262,15 @@ describe("next dev", () => {
     expect(body).not.toContain("data:image")
   })
 
+  test("converted page frontmatter contains only title then description", async () => {
+    const res = await get(DEV_PORT, "/docs/getting-started.md")
+    expect(res.status).toBe(200)
+    const frontmatter = (await res.text()).split("---", 3)[1]?.trim()
+    expect(frontmatter).toBe(
+      "title: Getting Started | Fixture Site\nmeta-description: How to get started with the fixture."
+    )
+  })
+
   test("Accept: text/markdown negotiates markdown", async () => {
     const res = await get(DEV_PORT, "/docs/getting-started", {
       accept: "text/markdown",
@@ -552,6 +561,15 @@ describe("next build", () => {
     expect(body).not.toContain("self.__next")
     expect(body).not.toContain("\n---\ntitle:")
     expect(body).not.toContain("meta-description:")
+  })
+
+  test("converted files contain only title then description in frontmatter", () => {
+    const frontmatter = read("docs/getting-started.md")
+      .split("---", 3)[1]
+      ?.trim()
+    expect(frontmatter).toBe(
+      "title: Getting Started | Fixture Site\nmeta-description: How to get started with the fixture."
+    )
   })
 
   test("check 9 (amended): image references are real URLs, no data: URIs anywhere", () => {
