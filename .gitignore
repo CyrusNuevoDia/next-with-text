@@ -32,7 +32,8 @@ tests/fixtures/next/public/llms.txt
 tests/fixtures/next/public/llms-full.txt
 tests/fixtures/next/public/**/*.md
 
-# codegen'd on-demand route (written by withText at config load)
+# codegen'd on-demand route — deleted when its build/dev process exits, so this
+# only catches what a SIGKILLed dev server leaves behind
 tests/fixtures/next/app/%5Fllms/
 
 # caches

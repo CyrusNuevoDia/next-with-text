@@ -22,6 +22,8 @@ That's the entire integration. Your app now serves:
 
 No route handlers to write, no middleware, no config files, no route lists to maintain. It reads your build output — not your source tree — so nothing it needs disappears in a serverless bundle. ChatGPT, Claude, Perplexity, and coding agents can read your site the way they want to.
 
+Building locally leaves nothing behind: the generated files exist only for the deploy build that needs them ([details](#generated-files-clean-up-after-themselves)).
+
 Requires Next.js 16+ and the App Router.
 
 ## Why this exists
@@ -115,18 +117,30 @@ llmstxt: ({ title, description, routes }) =>
 
 `routes` is the final route list — filtered, auth-excluded, with any `md` overrides applied. This only affects `llms.txt`; `llms-full.txt` has no knobs.
 
-## Setup notes
+## Generated files clean up after themselves
 
-Add the generated artifacts to `.gitignore` — they're rebuilt on every `next build` (adjust the `.md` pattern if you keep your own markdown files in `public/`):
+Building locally leaves your working tree exactly as it was. Nothing to gitignore, nothing to review, no diff noise:
 
-```gitignore
-public/llms.txt
-public/llms-full.txt
-public/**/*.md
-app/%5Fllms/
+- **`app/%5Fllms/`** — the two-line route file that powers on-demand conversion. It's written when the build or dev server starts and deleted when that process exits (Next's typegen reference to it is scrubbed too, so your editor never shows a dangling import). While `next dev` is running the file stays put, and a `next build` in another terminal won't pull it out from under the dev server.
+- **`public/llms.txt`, `public/llms-full.txt`, `public/<route>.md`** — the static tier, written only when the build is a **deploy** build. Locally they're never written, and any left over from an earlier deploy build get reclaimed.
+
+A deploy build is one where `CI` or `VERCEL` is set — true on Vercel, GitHub Actions, and essentially every CI runner. If you build the artifact you actually deploy somewhere those aren't set (a self-hosted box, a release script on your laptop), open the gate by hand:
+
+```bash
+NEXT_WITH_TEXT_STATIC=1 next build
 ```
 
-`app/%5Fllms/` is a directory holding the two-line route file `withText` generates to power on-demand conversion (dev, dynamic pages, and any request no static file covers). It's regenerated automatically — gitignore it and forget it.
+The same variable set to `0` forces local behavior anywhere, including CI. With `output: "standalone"` the files are also written into `.next/standalone/public` on every build — that tree is the deployable artifact, never your working copy — so a standalone build shouldn't need the override. That path hasn't been verified on a real standalone deploy yet; set `NEXT_WITH_TEXT_STATIC=1` if you'd rather not rely on it.
+
+Local `next start` serves every surface identically — the on-demand route covers what the static files would have. It's a request-time HTML conversion rather than a file read, so it's slower than production, and it's the only difference you'll see.
+
+Files you edit by hand are never deleted: pruning removes a file only when its contents still match what the last build wrote.
+
+If a dev server is killed with `SIGKILL` (or your machine loses power), `app/%5Fllms/` can survive — the next build or dev run clears it. Gitignore it if a crash-leftover in `git status` would bother you:
+
+```gitignore
+app/%5Fllms/
+```
 
 ## What it's not for
 
