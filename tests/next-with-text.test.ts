@@ -1,9 +1,30 @@
 // Verifier suite for docs/shaping.md's checks. Order matters: the dev-serving checks run
 // first (they need a fixture with no build artifacts), then `next build` + file
 // checks, then `next start` + HTTP checks, then the alternate-config
-// `llmstxt` build (it clobbers the main build's output, so it goes last).
-import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test"
-import { existsSync, readdirSync, readFileSync, rmSync, symlinkSync } from "node:fs"
+// `llmstxt` build (it clobbers the main build's output, so it goes last), and
+// finally the local (non-deploy) build, which needs the previous build's
+// output to prove it reclaims it.
+//
+// Careful with `bun test -t "…"`: filtering skips tests but still runs every
+// describe's beforeAll, so another describe's cleanFixture() can produce the
+// state your filtered test asserts. A filtered green is not a green — this
+// suite has already handed out one false pass that way.
+import {
+  afterAll,
+  beforeAll,
+  describe,
+  expect,
+  setDefaultTimeout,
+  test,
+} from "bun:test"
+import {
+  existsSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs"
 import { join } from "node:path"
 
 setDefaultTimeout(240_000)
@@ -15,6 +36,12 @@ const PUBLIC = join(FIXTURE, "public")
 
 const DEV_PORT = 4311
 const START_PORT = 4312
+const LOCAL_START_PORT = 4313
+
+// the prune ownership probe: a generated file the user edits afterwards must
+// survive the local build that reclaims everything else
+const HAND_EDITED = "docs/api/auth.md"
+const HAND_EDIT = "hand-edited, not ours to delete\n"
 
 const GENERATED = [
   "index.md",
@@ -32,70 +59,96 @@ const GENERATED = [
 ]
 
 // routes that must never produce a public file
-const NEVER_GENERATED = ["docs/internal/secrets.md", "account.md", "admin.md", "echo.md"]
+const NEVER_GENERATED = [
+  "docs/internal/secrets.md",
+  "account.md",
+  "admin.md",
+  "echo.md",
+]
 
 function cleanFixture(): void {
-  rmSync(join(FIXTURE, ".next"), { recursive: true, force: true })
-  rmSync(join(FIXTURE, "app", "%5Fllms"), { recursive: true, force: true })
+  rmSync(join(FIXTURE, ".next"), { force: true, recursive: true })
+  rmSync(join(FIXTURE, "app", "%5Fllms"), { force: true, recursive: true })
   for (const rel of [...GENERATED, ...NEVER_GENERATED]) {
     rmSync(join(PUBLIC, rel), { force: true })
   }
   for (const dir of ["tags", "blog", "docs"]) {
-    rmSync(join(PUBLIC, dir), { recursive: true, force: true })
+    rmSync(join(PUBLIC, dir), { force: true, recursive: true })
   }
 }
 
 async function ensureToolchain(): Promise<void> {
   const build = Bun.spawnSync(["bun", "run", "build"], { cwd: ROOT })
-  if (build.exitCode !== 0) throw new Error(`library build failed:\n${build.stderr.toString()}`)
+  if (build.exitCode !== 0) {
+    throw new Error(`library build failed:\n${build.stderr.toString()}`)
+  }
   if (!existsSync(join(FIXTURE, "node_modules"))) {
     const install = Bun.spawnSync(["bun", "install"], { cwd: FIXTURE })
-    if (install.exitCode !== 0) throw new Error(`fixture install failed:\n${install.stderr.toString()}`)
+    if (install.exitCode !== 0) {
+      throw new Error(`fixture install failed:\n${install.stderr.toString()}`)
+    }
   }
   const link = join(FIXTURE, "node_modules", "next-with-text")
-  if (!existsSync(link)) symlinkSync(join("..", "..", "..", ".."), link)
+  if (!existsSync(link)) {
+    symlinkSync(join("..", "..", "..", ".."), link)
+  }
 }
 
+// CI=1 makes the build deploy-shaped (static tier written to public/) no
+// matter where the suite runs; the local-build describe overrides it away.
 async function buildFixture(env: Record<string, string> = {}): Promise<void> {
   const proc = Bun.spawn([NEXT_BIN, "build"], {
     cwd: FIXTURE,
-    stdout: "pipe",
+    env: { ...process.env, CI: "1", ...env },
     stderr: "pipe",
-    env: { ...process.env, ...env },
+    stdout: "pipe",
   })
   const [out, err] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
   ])
-  if ((await proc.exited) !== 0) throw new Error(`next build failed:\n${out}\n${err}`)
+  if ((await proc.exited) !== 0) {
+    throw new Error(`next build failed:\n${out}\n${err}`)
+  }
 }
 
-type Server = { stop: () => Promise<void>; logs: () => string }
+interface Server {
+  logs: () => string
+  stop: () => Promise<void>
+}
 
 async function startServer(args: string[], port: number): Promise<Server> {
   // a stale server on the port makes every assertion meaningless — fail loudly
   const squatter = Bun.spawnSync(["lsof", "-ti", `:${port}`])
   if (squatter.stdout.toString().trim() !== "") {
-    throw new Error(`port ${port} is already in use: pid(s) ${squatter.stdout.toString().trim()}`)
+    throw new Error(
+      `port ${port} is already in use: pid(s) ${squatter.stdout.toString().trim()}`
+    )
   }
 
   const proc = Bun.spawn([NEXT_BIN, ...args, "-p", String(port)], {
     cwd: FIXTURE,
-    stdout: "pipe",
     stderr: "pipe",
+    stdout: "pipe",
   })
   let logs = ""
   const capture = async (stream: ReadableStream<Uint8Array>) => {
-    for await (const chunk of stream) logs += new TextDecoder().decode(chunk)
+    for await (const chunk of stream) {
+      logs += new TextDecoder().decode(chunk)
+    }
   }
   capture(proc.stdout)
   capture(proc.stderr)
 
   const deadline = Date.now() + 120_000
   while (Date.now() < deadline) {
-    if (proc.exitCode !== null) throw new Error(`server exited early (${proc.exitCode}):\n${logs}`)
+    if (proc.exitCode !== null) {
+      throw new Error(`server exited early (${proc.exitCode}):\n${logs}`)
+    }
     try {
-      await fetch(`http://localhost:${port}/`, { signal: AbortSignal.timeout(2_000) })
+      await fetch(`http://localhost:${port}/`, {
+        signal: AbortSignal.timeout(2000),
+      })
       break
     } catch {
       await Bun.sleep(500)
@@ -106,13 +159,23 @@ async function startServer(args: string[], port: number): Promise<Server> {
     logs: () => logs,
     stop: async () => {
       proc.kill()
-      await Promise.race([proc.exited, Bun.sleep(5_000).then(() => proc.kill(9))])
+      await Promise.race([
+        proc.exited,
+        Bun.sleep(5000).then(() => proc.kill(9)),
+      ])
     },
   }
 }
 
-function get(port: number, path: string, headers: Record<string, string> = {}): Promise<Response> {
-  return fetch(`http://localhost:${port}${path}`, { headers, redirect: "manual" })
+function get(
+  port: number,
+  path: string,
+  headers: Record<string, string> = {}
+): Promise<Response> {
+  return fetch(`http://localhost:${port}${path}`, {
+    headers,
+    redirect: "manual",
+  })
 }
 
 const BROWSER_ACCEPT =
@@ -176,7 +239,9 @@ describe("next dev", () => {
   })
 
   test("Accept: text/markdown negotiates markdown", async () => {
-    const res = await get(DEV_PORT, "/docs/getting-started", { accept: "text/markdown" })
+    const res = await get(DEV_PORT, "/docs/getting-started", {
+      accept: "text/markdown",
+    })
     expect(res.status).toBe(200)
     const body = await res.text()
     expect(body).toContain("SENTINEL_GETTING_STARTED")
@@ -188,21 +253,53 @@ describe("next dev", () => {
     expect(anonymous.status).toBe(200)
     expect(await anonymous.text()).toContain("session=none")
 
-    const authed = await get(DEV_PORT, "/account.md", { cookie: "session=abc123" })
+    const authed = await get(DEV_PORT, "/account.md", {
+      cookie: "session=abc123",
+    })
     expect(await authed.text()).toContain("session=abc123")
   })
 
   test("check 24 (dev): params reach the md function", async () => {
-    expect(await (await get(DEV_PORT, "/tags/alpha.md")).text()).toContain("MD_TAG_alpha")
+    expect(await (await get(DEV_PORT, "/tags/alpha.md")).text()).toContain(
+      "MD_TAG_alpha"
+    )
   })
 
   test("check 25 (dev): searchParams reach the md function", async () => {
-    expect(await (await get(DEV_PORT, "/echo.md?q=xyz")).text()).toContain("MD_ECHO_xyz")
-    expect(await (await get(DEV_PORT, "/echo.md")).text()).toContain("MD_ECHO_none")
+    expect(await (await get(DEV_PORT, "/echo.md?q=xyz")).text()).toContain(
+      "MD_ECHO_xyz"
+    )
+    expect(await (await get(DEV_PORT, "/echo.md")).text()).toContain(
+      "MD_ECHO_none"
+    )
   })
 
   test("check 22 (dev): excluded routes 404 on the on-demand tier", async () => {
     expect((await get(DEV_PORT, "/docs/internal/secrets.md")).status).toBe(404)
+  })
+
+  test("a concurrent next build leaves the running dev server's route intact", async () => {
+    await buildFixture({ CI: "" })
+    expect(existsSync(join(FIXTURE, "app", "%5Fllms"))).toBe(true)
+    const res = await get(DEV_PORT, "/llms.txt")
+    expect(res.status).toBe(200)
+    expect(await res.text()).toContain("](/about.md)")
+  })
+
+  // runs last in this describe: it shuts the server down
+  test("stopping the dev server removes the generated route and scrubs dev typegen", async () => {
+    const routeDir = join(FIXTURE, "app", "%5Fllms")
+    expect(existsSync(routeDir)).toBe(true) // dev compiles from source — it must exist while serving
+    await server.stop()
+    const deadline = Date.now() + 10_000
+    while (existsSync(routeDir) && Date.now() < deadline) {
+      await Bun.sleep(200)
+    }
+    expect(existsSync(routeDir)).toBe(false)
+    const devValidator = join(FIXTURE, ".next", "dev", "types", "validator.ts")
+    if (existsSync(devValidator)) {
+      expect(readFileSync(devValidator, "utf8")).not.toContain("%5Fllms")
+    }
   })
 })
 
@@ -219,25 +316,50 @@ describe("next build", () => {
 
   const read = (rel: string) => readFileSync(join(PUBLIC, rel), "utf8")
 
+  test("the generated app/%5Fllms route is gone once the build finishes", () => {
+    expect(existsSync(join(FIXTURE, "app", "%5Fllms"))).toBe(false)
+  })
+
+  test("typegen keeps no dangling reference to the deleted route — tsc stays clean", () => {
+    const validator = readFileSync(
+      join(FIXTURE, ".next", "types", "validator.ts"),
+      "utf8"
+    )
+    expect(validator).not.toContain("%5Fllms")
+    const tsc = Bun.spawnSync(["bunx", "tsc", "--noEmit"], { cwd: FIXTURE })
+    expect(tsc.stdout.toString() + tsc.stderr.toString()).toBe("")
+    expect(tsc.exitCode).toBe(0)
+  })
+
   test("check 1: every included prerendered page got its file, nothing else", () => {
-    for (const rel of GENERATED) expect(existsSync(join(PUBLIC, rel))).toBe(true)
-    for (const rel of NEVER_GENERATED) expect(existsSync(join(PUBLIC, rel))).toBe(false)
+    for (const rel of GENERATED) {
+      expect(existsSync(join(PUBLIC, rel))).toBe(true)
+    }
+    for (const rel of NEVER_GENERATED) {
+      expect(existsSync(join(PUBLIC, rel))).toBe(false)
+    }
   })
 
   test("check 2: llms.txt template — header, then unheaded root links", () => {
     expect(read("llms.txt")).toStartWith(
-      "# Fixture Site\n\n> A test site.\n\n- [Fixture Site](/index.md): A test site.\n",
+      "# Fixture Site\n\n> A test site.\n\n- [Fixture Site](/index.md): A test site.\n"
     )
   })
 
   test("check 3: links derive from rendered metadata; every line well-formed", () => {
     const body = read("llms.txt")
-    expect(body).toContain("- [About Us | Fixture Site](/about.md): Who we are and why.")
-    expect(body).toContain("- [Post: hello | Fixture Site](/blog/hello.md): Blog post about hello.")
     expect(body).toContain(
-      "- [Getting Started | Fixture Site](/docs/getting-started.md): How to get started with the fixture.",
+      "- [About Us | Fixture Site](/about.md): Who we are and why."
     )
-    expect(body).toContain("- [Tag: alpha | Fixture Site](/tags/alpha.md): Pages tagged alpha.")
+    expect(body).toContain(
+      "- [Post: hello | Fixture Site](/blog/hello.md): Blog post about hello."
+    )
+    expect(body).toContain(
+      "- [Getting Started | Fixture Site](/docs/getting-started.md): How to get started with the fixture."
+    )
+    expect(body).toContain(
+      "- [Tag: alpha | Fixture Site](/tags/alpha.md): Pages tagged alpha."
+    )
     // every link line is `- [title](/route.md): description`
     for (const line of body.split("\n").filter((l) => l.startsWith("- "))) {
       expect(line).toMatch(/^- \[.+\]\(\/[^)]+\.md\): .+$/)
@@ -260,7 +382,7 @@ describe("next build", () => {
       "(/docs/getting-started.md)",
       "## Tags",
       "(/tags/alpha.md)",
-      "(/tags/beta.md)",
+      "(/tags/beta.md)"
     )
     // root links come before any section heading
     expect(body.indexOf("(/zebra.md)")).toBeLessThan(body.indexOf("## "))
@@ -271,14 +393,20 @@ describe("next build", () => {
 
   test("check 18: object-form md overrides the index entry", () => {
     const body = read("llms.txt")
-    expect(body).toContain("- [MD_TITLE_TOKENS](/docs/api/tokens.md): MD_DESC_TOKENS")
+    expect(body).toContain(
+      "- [MD_TITLE_TOKENS](/docs/api/tokens.md): MD_DESC_TOKENS"
+    )
     expect(body).not.toContain("OG_TITLE_TOKENS")
     // string-form pages keep rendered metadata
-    expect(body).toContain("- [About Us | Fixture Site](/about.md): Who we are and why.")
+    expect(body).toContain(
+      "- [About Us | Fixture Site](/about.md): Who we are and why."
+    )
   })
 
   test("check 19: plain-value md export — entry and content", () => {
-    expect(read("llms.txt")).toContain("- [MD_TITLE_PLAIN](/plain.md): MD_DESC_PLAIN")
+    expect(read("llms.txt")).toContain(
+      "- [MD_TITLE_PLAIN](/plain.md): MD_DESC_PLAIN"
+    )
     expect(read("plain.md")).toContain("MD_CONTENT_PLAIN")
   })
 
@@ -333,8 +461,12 @@ describe("next build", () => {
   })
 
   test("check 9 (amended): image references are real URLs, no data: URIs anywhere", () => {
-    expect(read("docs/getting-started.md")).toContain("![The team](/images/team.png)")
-    for (const rel of GENERATED) expect(read(rel)).not.toContain("data:image")
+    expect(read("docs/getting-started.md")).toContain(
+      "![The team](/images/team.png)"
+    )
+    for (const rel of GENERATED) {
+      expect(read(rel)).not.toContain("data:image")
+    }
   })
 
   test("check 20: txt is gone — no .txt output besides the llms surfaces", () => {
@@ -347,17 +479,23 @@ describe("next build", () => {
 
   test("check 22: shared exclude scrubs /docs/internal/** from every surface", () => {
     expect(existsSync(join(PUBLIC, "docs/internal/secrets.md"))).toBe(false)
-    for (const rel of GENERATED) expect(read(rel)).not.toContain("SENTINEL_SECRETS")
+    for (const rel of GENERATED) {
+      expect(read(rel)).not.toContain("SENTINEL_SECRETS")
+    }
     expect(read("llms.txt")).not.toContain("/docs/internal/")
   })
 
   test("check 11: dynamic authed /account leaks into nothing", () => {
-    for (const rel of GENERATED) expect(read(rel)).not.toContain("SENTINEL_ACCOUNT")
+    for (const rel of GENERATED) {
+      expect(read(rel)).not.toContain("SENTINEL_ACCOUNT")
+    }
     expect(read("llms.txt")).not.toContain("/account.md")
   })
 
   test("check 12: proxy-matcher auto-exclusion removes static /admin from every surface", () => {
-    for (const rel of GENERATED) expect(read(rel)).not.toContain("SENTINEL_ADMIN")
+    for (const rel of GENERATED) {
+      expect(read(rel)).not.toContain("SENTINEL_ADMIN")
+    }
     expect(read("llms.txt")).not.toContain("/admin.md")
   })
 })
@@ -381,7 +519,9 @@ describe("next start", () => {
   test("llms surfaces serve over HTTP", async () => {
     const index = await get(START_PORT, "/llms.txt")
     expect(index.status).toBe(200)
-    expect(await index.text()).toStartWith("# Fixture Site\n\n> A test site.\n\n- [")
+    expect(await index.text()).toStartWith(
+      "# Fixture Site\n\n> A test site.\n\n- ["
+    )
 
     const full = await get(START_PORT, "/llms-full.txt")
     expect(full.status).toBe(200)
@@ -389,23 +529,35 @@ describe("next start", () => {
   })
 
   test("check 6/7: .md twins serve, unknown .md 404s", async () => {
-    expect(await (await get(START_PORT, "/about.md")).text()).toContain("MD_OVERRIDE_ABOUT")
-    expect(await (await get(START_PORT, "/docs/getting-started.md")).text()).toContain(
-      "SENTINEL_GETTING_STARTED",
+    expect(await (await get(START_PORT, "/about.md")).text()).toContain(
+      "MD_OVERRIDE_ABOUT"
     )
-    expect(await (await get(START_PORT, "/zebra.md")).text()).toContain("SENTINEL_ZEBRA")
-    expect(await (await get(START_PORT, "/plain.md")).text()).toContain("MD_CONTENT_PLAIN")
-    expect(await (await get(START_PORT, "/tags/alpha.md")).text()).toContain("MD_TAG_alpha")
+    expect(
+      await (await get(START_PORT, "/docs/getting-started.md")).text()
+    ).toContain("SENTINEL_GETTING_STARTED")
+    expect(await (await get(START_PORT, "/zebra.md")).text()).toContain(
+      "SENTINEL_ZEBRA"
+    )
+    expect(await (await get(START_PORT, "/plain.md")).text()).toContain(
+      "MD_CONTENT_PLAIN"
+    )
+    expect(await (await get(START_PORT, "/tags/alpha.md")).text()).toContain(
+      "MD_TAG_alpha"
+    )
     expect((await get(START_PORT, "/nonexistent.md")).status).toBe(404)
   })
 
   test("check 8: Accept negotiation — markdown clients get markdown, browsers get HTML", async () => {
-    const markdown = await get(START_PORT, "/docs/getting-started", { accept: "text/markdown" })
+    const markdown = await get(START_PORT, "/docs/getting-started", {
+      accept: "text/markdown",
+    })
     const markdownBody = await markdown.text()
     expect(markdownBody).toContain("SENTINEL_GETTING_STARTED")
     expect(markdownBody).not.toContain("<article")
 
-    const browser = await get(START_PORT, "/docs/getting-started", { accept: BROWSER_ACCEPT })
+    const browser = await get(START_PORT, "/docs/getting-started", {
+      accept: BROWSER_ACCEPT,
+    })
     const browserBody = await browser.text()
     expect(browserBody).toContain("<!DOCTYPE html>")
     expect(browserBody).toContain("SENTINEL_GETTING_STARTED")
@@ -418,14 +570,18 @@ describe("next start", () => {
   })
 
   test("check 22: excluded routes 404 on the on-demand tier", async () => {
-    expect((await get(START_PORT, "/docs/internal/secrets.md")).status).toBe(404)
+    expect((await get(START_PORT, "/docs/internal/secrets.md")).status).toBe(
+      404
+    )
   })
 
   test("check 25: searchParams reach the md function on demand", async () => {
     const withQuery = await get(START_PORT, "/echo.md?q=xyz")
     expect(withQuery.status).toBe(200)
     expect(await withQuery.text()).toContain("MD_ECHO_xyz")
-    expect(await (await get(START_PORT, "/echo.md")).text()).toContain("MD_ECHO_none")
+    expect(await (await get(START_PORT, "/echo.md")).text()).toContain(
+      "MD_ECHO_none"
+    )
   })
 
   test("check 13: on-demand cookie-aware conversion of the dynamic /account page", async () => {
@@ -433,7 +589,9 @@ describe("next start", () => {
     expect(anonymous.status).toBe(200)
     expect(await anonymous.text()).toContain("session=none")
 
-    const authed = await get(START_PORT, "/account.md", { cookie: "session=abc123" })
+    const authed = await get(START_PORT, "/account.md", {
+      cookie: "session=abc123",
+    })
     expect(await authed.text()).toContain("session=abc123")
 
     const negotiated = await get(START_PORT, "/account", {
@@ -447,7 +605,9 @@ describe("next start", () => {
 
   test("proxy-guarded /admin.md stays gated on demand", async () => {
     expect((await get(START_PORT, "/admin.md")).status).toBe(404)
-    const authed = await get(START_PORT, "/admin.md", { cookie: "session=abc123" })
+    const authed = await get(START_PORT, "/admin.md", {
+      cookie: "session=abc123",
+    })
     expect(await authed.text()).toContain("SENTINEL_ADMIN")
   })
 })
@@ -473,9 +633,13 @@ describe("llmstxt function build", () => {
 
   test("check 23: ctx.routes is flat, hrefs are .md, index precedence applied", () => {
     const body = read("llms.txt")
-    expect(body).toContain("ROUTE:MD_TITLE_TOKENS|/docs/api/tokens.md|MD_DESC_TOKENS")
+    expect(body).toContain(
+      "ROUTE:MD_TITLE_TOKENS|/docs/api/tokens.md|MD_DESC_TOKENS"
+    )
     expect(body).toContain("ROUTE:MD_TITLE_PLAIN|/plain.md|MD_DESC_PLAIN")
-    expect(body).toContain("ROUTE:About Us | Fixture Site|/about.md|Who we are and why.")
+    expect(body).toContain(
+      "ROUTE:About Us | Fixture Site|/about.md|Who we are and why."
+    )
     // filters and auth exclusion still applied to ctx.routes
     expect(body).not.toContain("/docs/internal/")
     expect(body).not.toContain("/account.md")
@@ -487,5 +651,100 @@ describe("llmstxt function build", () => {
     expect(body).toStartWith("# Fixture Site")
     expect(body).not.toContain("LLMSTXT_FN")
     expect(body).toContain("MD_CONTENT_TOKENS")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Local builds — no deploy env (CI/VERCEL unset): the static tier is skipped,
+// leftovers from earlier deploy builds are pruned, and next start serves every
+// surface through the on-demand route instead.
+// ---------------------------------------------------------------------------
+
+describe("local build — no deploy env", () => {
+  let server: Server
+
+  beforeAll(async () => {
+    // the llmstxt describe just left deploy-built files in public/ — this
+    // build must remove them and add nothing new
+    writeFileSync(join(PUBLIC, HAND_EDITED), HAND_EDIT)
+    await buildFixture({ CI: "", VERCEL: "" })
+    server = await startServer(["start"], LOCAL_START_PORT)
+  })
+
+  afterAll(async () => {
+    await server?.stop()
+  })
+
+  test("public/ carries no generated files after a local build", () => {
+    for (const rel of [...GENERATED, ...NEVER_GENERATED]) {
+      if (rel === HAND_EDITED) {
+        continue
+      }
+      expect(existsSync(join(PUBLIC, rel))).toBe(false)
+    }
+  })
+
+  test("a hand-edited generated file is never pruned", () => {
+    expect(readFileSync(join(PUBLIC, HAND_EDITED), "utf8")).toBe(HAND_EDIT)
+  })
+
+  test("directories emptied by pruning go too, but ones still holding files stay", () => {
+    expect(existsSync(join(PUBLIC, "tags"))).toBe(false)
+    expect(existsSync(join(PUBLIC, "blog"))).toBe(false)
+    // docs/api still holds the hand-edited file
+    expect(existsSync(join(PUBLIC, "docs", "api"))).toBe(true)
+  })
+
+  test("llms.txt serves on demand from the built route list", async () => {
+    const res = await get(LOCAL_START_PORT, "/llms.txt")
+    expect(res.status).toBe(200)
+    const body = await res.text()
+    expect(body).toContain("# Fixture Site")
+    expect(body).toContain("> A test site.")
+    // dynamic instances from generateStaticParams are in the built output
+    expect(body).toContain("](/blog/hello.md)")
+    expect(body).toContain("](/tags/alpha.md)")
+    expect(body).toContain("## Docs")
+    // index-entry precedence still applies on demand
+    expect(body).toContain(
+      "- [MD_TITLE_TOKENS](/docs/api/tokens.md): MD_DESC_TOKENS"
+    )
+    // exclusions hold: shared exclude, proxy matcher, dynamic pages
+    expect(body).not.toContain("/docs/internal/")
+    expect(body).not.toContain("/admin.md")
+    expect(body).not.toContain("/account.md")
+    expect(body).not.toContain("/echo.md")
+  })
+
+  test("llms-full.txt serves on demand", async () => {
+    const res = await get(LOCAL_START_PORT, "/llms-full.txt")
+    expect(res.status).toBe(200)
+    const body = await res.text()
+    expect(body).toStartWith("# Fixture Site")
+    for (const present of [
+      "SENTINEL_HOME",
+      "MD_OVERRIDE_ABOUT",
+      "MD_TAG_alpha",
+      "SENTINEL_GETTING_STARTED",
+    ]) {
+      expect(body).toContain(present)
+    }
+    expect(body).not.toContain("SENTINEL_ADMIN")
+    expect(body).not.toContain("SENTINEL_ACCOUNT")
+    expect(body).not.toContain("SENTINEL_SECRETS")
+  })
+
+  test(".md twins and Accept negotiation serve on demand", async () => {
+    expect(await (await get(LOCAL_START_PORT, "/about.md")).text()).toContain(
+      "MD_OVERRIDE_ABOUT"
+    )
+    expect(await (await get(LOCAL_START_PORT, "/zebra.md")).text()).toContain(
+      "SENTINEL_ZEBRA"
+    )
+    expect((await get(LOCAL_START_PORT, "/nonexistent.md")).status).toBe(404)
+    const negotiated = await get(LOCAL_START_PORT, "/docs/getting-started", {
+      accept: "text/markdown",
+    })
+    expect(await negotiated.text()).toContain("SENTINEL_GETTING_STARTED")
   })
 })

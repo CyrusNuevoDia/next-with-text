@@ -1,90 +1,169 @@
 import { spawnSync } from "node:child_process"
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs"
 import { join, relative, sep } from "node:path"
 import type { NextConfig } from "next"
-import { resolveOptions, type ResolvedOptions, type WithTextOptions } from "./shared"
+import {
+  claimGeneratedRoute,
+  cleanupGeneratedRoute,
+  releaseGeneratedRoute,
+} from "./cleanup"
+import {
+  type ResolvedOptions,
+  type RouteOptions,
+  resolveOptions,
+  type WithTextOptions,
+} from "./shared"
 
-export type { LlmstxtContext, MarkdownContent, MarkdownPage, MarkdownProps, WithTextOptions } from "./shared"
+export type {
+  LlmstxtContext,
+  MarkdownContent,
+  MarkdownPage,
+  MarkdownProps,
+  WithTextOptions,
+} from "./shared"
 
-type ConfigContext = { defaultConfig?: NextConfig }
-type ConfigFn = (phase: string, ctx: ConfigContext) => NextConfig | Promise<NextConfig>
+interface ConfigContext {
+  defaultConfig?: NextConfig
+}
+type ConfigFn = (
+  phase: string,
+  ctx: ConfigContext
+) => NextConfig | Promise<NextConfig>
 
 const PHASE_BUILD = "phase-production-build"
 const PHASE_DEV = "phase-development-server"
 
 let patchRegistered = false
+let devCleanupRegistered = false
 
-type Capture = { llmstxt?: WithTextOptions["llmstxt"] }
+interface Capture {
+  llmstxt?: WithTextOptions["llmstxt"]
+}
 
-export function withText(nextConfig: NextConfig | ConfigFn = {}, options: WithTextOptions = {}): ConfigFn {
+export function withText(
+  nextConfig: NextConfig | ConfigFn = {},
+  options: WithTextOptions = {}
+): ConfigFn {
   const resolved = resolveOptions(options)
 
   return async (phase, ctx) => {
-    const base = typeof nextConfig === "function" ? await nextConfig(phase, ctx) : nextConfig
+    const base =
+      typeof nextConfig === "function"
+        ? await nextConfig(phase, ctx)
+        : nextConfig
 
     // The build-exit child re-loads this config to reach the llmstxt function
     // (it can't cross the process boundary as JSON) — hand it over and do
     // nothing else in that pass, or the child would re-register the exit hook
     // and recurse.
-    const capture = (globalThis as { __NEXT_WITH_TEXT_CAPTURE__?: Capture }).__NEXT_WITH_TEXT_CAPTURE__
+    const capture = (globalThis as { __NEXT_WITH_TEXT_CAPTURE__?: Capture })
+      .__NEXT_WITH_TEXT_CAPTURE__
     if (capture) {
       capture.llmstxt = options.llmstxt
       return base
     }
 
     const dir = process.cwd()
-    if (phase === PHASE_BUILD || phase === PHASE_DEV) generateRoute(dir, resolved)
+    if (phase === PHASE_BUILD || phase === PHASE_DEV) {
+      generateRoute(dir, { ...resolved, dev: phase === PHASE_DEV })
+    }
+    if (phase === PHASE_DEV && !devCleanupRegistered) {
+      devCleanupRegistered = true
+      // Dev compiles the route from source, so it must live for the whole
+      // session: claim it, and let the exit hook release the claim and clean
+      // up. Whichever process loads the config gets the claim (in Next 16 dev
+      // that is a NEXT_PRIVATE_WORKER process — the dev server itself), and
+      // the per-pid claims are what keep a concurrent `next build`, or a
+      // second dev server, from deleting the route out from under this one.
+      // Next exits via process.exit() on SIGINT/SIGTERM (probe-verified in
+      // every dev process), so `exit` is a reliable teardown point.
+      claimGeneratedRoute(dir)
+      process.once("exit", () => {
+        releaseGeneratedRoute(dir)
+        cleanupGeneratedRoute(dir)
+      })
+    }
     if (phase === PHASE_BUILD && !patchRegistered) {
       patchRegistered = true
       // `beforeExit` never fires (next build calls process.exit()), and by `exit`
       // all static generation is done — the only reliable inside-build point.
       // The handler must be sync, so async work happens in a spawnSync'd child.
       process.once("exit", (code) => {
-        if (code !== 0) return
-        // __dirname is dist/ when the built entry ran, but src/ when a TS-aware
-        // config loader compiled this source file directly — check both.
-        const patch = [join(__dirname, "patch.cjs"), join(__dirname, "..", "dist", "patch.cjs")].find(
-          existsSync,
-        )
-        if (!patch) {
-          console.error("[next-with-text] patch.cjs not found — run the package build")
-          return
+        if (code === 0) {
+          // __dirname is dist/ when the built entry ran, but src/ when a TS-aware
+          // config loader compiled this source file directly — check both.
+          const patch = [
+            join(import.meta.dirname, "patch.cjs"),
+            join(import.meta.dirname, "..", "dist", "patch.cjs"),
+          ].find(existsSync)
+          if (patch) {
+            const payload = {
+              dir,
+              hasLlmstxt: typeof options.llmstxt === "function",
+              options: resolved,
+            }
+            spawnSync(process.execPath, [patch, JSON.stringify(payload)], {
+              stdio: "inherit",
+            })
+          } else {
+            console.error(
+              "[next-with-text] patch.cjs not found — run the package build"
+            )
+          }
         }
-        const payload = { dir, options: resolved, hasLlmstxt: typeof options.llmstxt === "function" }
-        spawnSync(process.execPath, [patch, JSON.stringify(payload)], { stdio: "inherit" })
+        // the route source only had to exist for the build itself — the compiled
+        // copy in .next is what serves; leaving it behind is noise in app/
+        cleanupGeneratedRoute(dir)
       })
     }
 
     return {
       ...base,
+      rewrites: composeRewrites(base.rewrites, resolved),
       // the converter is a native addon — Turbopack can't bundle it into the
       // generated route handler
       serverExternalPackages: [
-        ...new Set([...(base.serverExternalPackages ?? []), "@xberg-io/html-to-markdown"]),
+        ...new Set([
+          ...(base.serverExternalPackages ?? []),
+          "@xberg-io/html-to-markdown",
+        ]),
       ],
-      rewrites: composeRewrites(base.rewrites, resolved),
     }
   }
 }
 
-function generateRoute(dir: string, options: ResolvedOptions): void {
+function generateRoute(dir: string, options: RouteOptions): void {
   const appDir = ["src/app", "app"].map((d) => join(dir, d)).find(existsSync)
-  if (!appDir) return
+  if (!appDir) {
+    return
+  }
   // %5F is the URL-encoded underscore: a literal `_llms` folder is
   // routing-private and never mounts; this one serves /_llms/:path.
   const routeDir = join(appDir, "%5Fllms", "[...path]")
   const routeFile = join(routeDir, "route.ts")
   const loaders = scanMdPages(appDir)
-    .map(({ pattern, importPath }) => `  ${JSON.stringify(pattern)}: () => import(${JSON.stringify(importPath)}),`)
+    .map(
+      ({ pattern, importPath }) =>
+        `  ${JSON.stringify(pattern)}: () => import(${JSON.stringify(importPath)}),`
+    )
     .join("\n")
   const manifest = loaders === "" ? "{}" : `{\n${loaders}\n}`
-  const content = `// Generated by next-with-text at config load — do not edit; gitignore app/%5Fllms/.
+  const content = `// Generated by next-with-text at config load, deleted when the build or dev
+// server that generated it exits — do not edit.
 import { createHandler } from "next-with-text/route"
 
 export const GET = createHandler(${JSON.stringify(options)}, ${manifest})
 `
   try {
-    if (existsSync(routeFile) && readFileSync(routeFile, "utf8") === content) return
+    if (existsSync(routeFile) && readFileSync(routeFile, "utf8") === content) {
+      return
+    }
     mkdirSync(routeDir, { recursive: true })
     writeFileSync(routeFile, content)
   } catch {
@@ -95,7 +174,9 @@ export const GET = createHandler(${JSON.stringify(options)}, ${manifest})
 // Pages exporting `md` get a static dynamic-import in the generated route so
 // the on-demand tier can evaluate the export in every runtime — dev, start,
 // serverless — through the bundler instead of loading source at request time.
-function scanMdPages(appDir: string): Array<{ pattern: string; importPath: string }> {
+function scanMdPages(
+  appDir: string
+): Array<{ pattern: string; importPath: string }> {
   const pages: Array<{ pattern: string; importPath: string }> = []
   walk(appDir, "")
   return pages
@@ -104,37 +185,68 @@ function scanMdPages(appDir: string): Array<{ pattern: string; importPath: strin
     for (const entry of readdirSync(dirPath, { withFileTypes: true })) {
       const name = entry.name
       if (entry.isDirectory()) {
-        if (name.startsWith("_") || name.startsWith("%5F") || name.startsWith("@") || name.startsWith("[...")) {
+        if (
+          name.startsWith("_") ||
+          name.startsWith("%5F") ||
+          name.startsWith("@") ||
+          name.startsWith("[...")
+        ) {
           continue
         }
-        walk(join(dirPath, name), name.startsWith("(") ? route : `${route}/${name}`)
+        walk(
+          join(dirPath, name),
+          name.startsWith("(") ? route : `${route}/${name}`
+        )
         continue
       }
-      if (!/^page\.(tsx|jsx|ts|js|mdx)$/.test(name)) continue
+      if (!/^page\.(tsx|jsx|ts|js|mdx)$/.test(name)) {
+        continue
+      }
       const source = readFileSync(join(dirPath, name), "utf8")
-      if (!/export\s+(?:const|let|var|async\s+function|function)\s+md\b/.test(source)) continue
+      if (
+        !/export\s+(?:const|let|var|async\s+function|function)\s+md\b/.test(
+          source
+        )
+      ) {
+        continue
+      }
       const rel = relative(appDir, join(dirPath, name))
         .split(sep)
         .join("/")
         .replace(/\.(tsx|jsx|ts|js|mdx)$/, "")
-      pages.push({ pattern: route === "" ? "/" : route, importPath: `../../${rel}` })
+      pages.push({
+        importPath: `../../${rel}`,
+        pattern: route === "" ? "/" : route,
+      })
     }
   }
 }
 
 type RewritesFn = NonNullable<NextConfig["rewrites"]>
-type RewriteRule = Awaited<ReturnType<RewritesFn>> extends infer R
-  ? R extends unknown[]
-    ? R[number]
+type RewriteRule =
+  Awaited<ReturnType<RewritesFn>> extends infer R
+    ? R extends unknown[]
+      ? R[number]
+      : never
     : never
-  : never
 
-function composeRewrites(userRewrites: NextConfig["rewrites"], options: ResolvedOptions): RewritesFn {
+function composeRewrites(
+  userRewrites: NextConfig["rewrites"],
+  options: ResolvedOptions
+): RewritesFn {
   return async () => {
     const user = userRewrites ? await userRewrites() : []
     const groups = Array.isArray(user)
-      ? { beforeFiles: [] as RewriteRule[], afterFiles: user, fallback: [] as RewriteRule[] }
-      : { beforeFiles: user.beforeFiles ?? [], afterFiles: user.afterFiles ?? [], fallback: user.fallback ?? [] }
+      ? {
+          afterFiles: user,
+          beforeFiles: [] as RewriteRule[],
+          fallback: [] as RewriteRule[],
+        }
+      : {
+          afterFiles: user.afterFiles ?? [],
+          beforeFiles: user.beforeFiles ?? [],
+          fallback: user.fallback ?? [],
+        }
 
     const beforeFiles = [...groups.beforeFiles]
     const afterFiles = [...groups.afterFiles]
@@ -143,18 +255,30 @@ function composeRewrites(userRewrites: NextConfig["rewrites"], options: Resolved
       // Accept negotiation: markdown-preferring clients (and not browsers, whose
       // Accept always includes text/html) get rewritten to the .md twin.
       beforeFiles.push({
-        source: "/:path((?!_next|api|_llms|.*\\.md$|.*\\.txt$).*)",
-        has: [{ type: "header" as const, key: "accept", value: "(?!.*text/html).*text/markdown.*" }],
         destination: "/:path.md",
+        has: [
+          {
+            key: "accept",
+            type: "header" as const,
+            value: "(?!.*text/html).*text/markdown.*",
+          },
+        ],
+        source: "/:path((?!_next|api|_llms|.*\\.md$|.*\\.txt$).*)",
       })
       // afterFiles runs after public files (a static .md still wins) but before
       // dynamic routes — a fallback rewrite would lose /tags/alpha.md to the
       // /tags/[tag] page itself.
-      afterFiles.push({ source: "/:path(.*\\.md)", destination: "/_llms/:path" })
+      afterFiles.push({
+        destination: "/_llms/:path",
+        source: "/:path(.*\\.md)",
+      })
     }
-    afterFiles.push({ source: "/llms.txt", destination: "/_llms/llms.txt" })
-    afterFiles.push({ source: "/llms-full.txt", destination: "/_llms/llms-full.txt" })
+    afterFiles.push({ destination: "/_llms/llms.txt", source: "/llms.txt" })
+    afterFiles.push({
+      destination: "/_llms/llms-full.txt",
+      source: "/llms-full.txt",
+    })
 
-    return { beforeFiles, afterFiles, fallback: groups.fallback }
+    return { afterFiles, beforeFiles, fallback: groups.fallback }
   }
 }

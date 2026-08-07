@@ -2,31 +2,52 @@
 // Walks the built HTML in .next/server/app — the build output IS the route
 // list, so auth-gated dynamic pages are absent by construction — and writes
 // the static surfaces into public/.
-import { convert } from "@xberg-io/html-to-markdown"
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+
+import { createHash } from "node:crypto"
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs"
 import { createRequire } from "node:module"
-import { dirname, join, relative, sep } from "node:path"
+import { dirname, join } from "node:path"
+import { convert } from "@xberg-io/html-to-markdown"
 import {
   CONVERT_OPTIONS,
+  discoverBuiltRoutes,
   evaluateMd,
+  type Link,
+  type LlmstxtContext,
   linkHref,
   matchesRoute,
   orderLinks,
+  type PageMeta,
   pageMeta,
+  type ResolvedMd,
+  type ResolvedOptions,
+  readProxyMatchers,
   renderFull,
   renderIndex,
   stripFrontmatter,
-  type Link,
-  type LlmstxtContext,
-  type PageMeta,
-  type ResolvedMd,
-  type ResolvedOptions,
 } from "./shared"
 
 const MANIFEST = "next-with-text-manifest.json"
 
-type Payload = { dir: string; options: ResolvedOptions; hasLlmstxt: boolean }
-type Page = { route: string; rendered: PageMeta; meta: PageMeta; content: string }
+interface Payload {
+  dir: string
+  hasLlmstxt: boolean
+  options: ResolvedOptions
+}
+interface Page {
+  content: string
+  meta: PageMeta
+  rendered: PageMeta
+  route: string
+}
 
 const payload = JSON.parse(process.argv[2] ?? "{}") as Payload
 
@@ -36,42 +57,55 @@ main(payload).catch((err) => {
 
 async function main({ dir, options, hasLlmstxt }: Payload): Promise<void> {
   const serverApp = join(dir, ".next", "server", "app")
-  if (!existsSync(join(dir, ".next", "BUILD_ID")) || !existsSync(serverApp)) return
+  if (!(existsSync(join(dir, ".next", "BUILD_ID")) && existsSync(serverApp))) {
+    return
+  }
 
-  const proxyMatchers = readProxyMatchers(join(dir, ".next", "server", "functions-config-manifest.json"))
-  const routes = discoverBuiltRoutes(serverApp)
+  const proxyMatchers = readProxyMatchers(dir)
+  const routes = (discoverBuiltRoutes(dir) ?? [])
     .filter((route) => matchesRoute(route, options))
     .filter((route) => !proxyMatchers.some((re) => re.test(route)))
-    .sort()
 
   const pages: Page[] = []
   for (const route of routes) {
-    const html = readFileSync(join(serverApp, route === "/" ? "index.html" : `${route.slice(1)}.html`), "utf8")
+    const html = readFileSync(
+      join(serverApp, route === "/" ? "index.html" : `${route.slice(1)}.html`),
+      "utf8"
+    )
     const result = convert(html, CONVERT_OPTIONS)
     const rendered = pageMeta(result.metadata)
     const override = await pageOverride(serverApp, route)
     pages.push({
-      route,
-      rendered,
+      content: override?.content ?? result.content ?? "",
       // object-form md exports curate the page's index entry; string form
       // keeps the rendered metadata
       meta: {
-        title: override?.title ?? rendered.title,
         description: override?.description ?? rendered.description,
+        title: override?.title ?? rendered.title,
       },
-      content: override?.content ?? result.content ?? "",
+      rendered,
+      route,
     })
   }
 
-  const site = pages.find((page) => page.route === "/")?.rendered ?? { title: "", description: "" }
-  const links: Link[] = pages.map((page) => ({ route: page.route, ...page.meta }))
+  const site = pages.find((page) => page.route === "/")?.rendered ?? {
+    description: "",
+    title: "",
+  }
+  const links: Link[] = pages.map((page) => ({
+    route: page.route,
+    ...page.meta,
+  }))
   const byRoute = new Map(pages.map((page) => [page.route, page]))
-  const writes: Array<[rel: string, content: string]> = []
+  const writes: [rel: string, content: string][] = []
 
   if (options.md) {
     for (const page of pages) {
       const rel = page.route === "/" ? "index.md" : `${page.route.slice(1)}.md`
-      writes.push([rel, page.content.endsWith("\n") ? page.content : `${page.content}\n`])
+      writes.push([
+        rel,
+        page.content.endsWith("\n") ? page.content : `${page.content}\n`,
+      ])
     }
   }
 
@@ -82,13 +116,13 @@ async function main({ dir, options, hasLlmstxt }: Payload): Promise<void> {
     "llms.txt",
     llmstxt
       ? llmstxt({
-          title: site.title,
           description: site.description,
           routes: orderLinks(links).map((link) => ({
-            title: link.title,
             description: link.description,
             href: linkHref(link.route, options.md),
+            title: link.title,
           })),
+          title: site.title,
         })
       : renderIndex(site, links, options.md),
   ])
@@ -96,64 +130,56 @@ async function main({ dir, options, hasLlmstxt }: Payload): Promise<void> {
     "llms-full.txt",
     renderFull(
       site,
-      orderLinks(links).map((link) => stripFrontmatter(byRoute.get(link.route)?.content ?? "").trim()),
+      orderLinks(links).map((link) =>
+        stripFrontmatter(byRoute.get(link.route)?.content ?? "").trim()
+      )
     ),
   ])
 
   const publicDir = join(dir, "public")
+  // The public/ tier is a deploy artifact: local builds skip it (the on-demand
+  // route serves everything under next start) so the working tree stays clean,
+  // and prune() below removes leftovers from an earlier deploy-shaped build.
+  const emitStatic = staticTierEnabled(process.env)
   // standalone output copies public/ during the build, before this hook runs —
-  // mirror the writes so the copied tree matches
+  // mirror the writes so the copied tree matches (it lives inside .next, so
+  // it's written regardless of the deploy gate)
   const standalonePublic = join(dir, ".next", "standalone", "public")
-  const written: string[] = []
+  const written: Record<string, string> = {}
   for (const [rel, content] of writes) {
-    for (const base of [publicDir, ...(existsSync(standalonePublic) ? [standalonePublic] : [])]) {
+    const targets = [
+      ...(emitStatic ? [publicDir] : []),
+      ...(existsSync(standalonePublic) ? [standalonePublic] : []),
+    ]
+    for (const base of targets) {
       const target = join(base, rel)
       mkdirSync(dirname(target), { recursive: true })
       writeFileSync(target, content)
     }
-    written.push(rel)
+    if (emitStatic) {
+      written[rel] = hashOf(content)
+    }
   }
 
   prune(dir, publicDir, written)
-  console.log(`[next-with-text] generated ${written.length} file(s) into public/`)
+  console.log(
+    emitStatic
+      ? `[next-with-text] generated ${Object.keys(written).length} file(s) into public/`
+      : "[next-with-text] local build — public/ untouched; llms surfaces serve on demand (set NEXT_WITH_TEXT_STATIC=1 to write them)"
+  )
 }
 
-function discoverBuiltRoutes(serverApp: string): string[] {
-  const routes: string[] = []
-  walk(serverApp)
-  return routes
-
-  function walk(dir: string): void {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const name = entry.name
-      if (name.startsWith("_") || name.startsWith("%5F")) continue
-      if (entry.isDirectory()) {
-        walk(join(dir, name))
-        continue
-      }
-      if (!name.endsWith(".html")) continue
-      const rel = relative(serverApp, join(dir, name)).slice(0, -".html".length)
-      if (rel === "404" || rel === "500") continue
-      routes.push(rel === "index" ? "/" : `/${rel.split(sep).join("/")}`)
-    }
+// Deploy detection: VERCEL/CI mark a build whose output ships somewhere;
+// NEXT_WITH_TEXT_STATIC overrides in either direction (self-hosters building
+// outside CI set it to 1).
+function staticTierEnabled(env: NodeJS.ProcessEnv): boolean {
+  const truthy = (value: string | undefined) =>
+    value !== undefined && value !== "" && value !== "0" && value !== "false"
+  const override = env.NEXT_WITH_TEXT_STATIC
+  if (override !== undefined && override !== "") {
+    return truthy(override)
   }
-}
-
-// Next 16 exposes proxy.ts matchers (compiled regexp + originalSource) in
-// functions-config-manifest.json — middleware-manifest.json stays empty.
-// Proxy-guarded routes are excluded from every static surface by default.
-function readProxyMatchers(manifestPath: string): RegExp[] {
-  if (!existsSync(manifestPath)) return []
-  try {
-    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
-      functions?: Record<string, { matchers?: Array<{ regexp: string }> }>
-    }
-    return Object.values(manifest.functions ?? {})
-      .flatMap((fn) => fn.matchers ?? [])
-      .map((matcher) => new RegExp(matcher.regexp))
-  } catch {
-    return []
-  }
+  return truthy(env.VERCEL) || truthy(env.CI)
 }
 
 // Pages may `export const md` (plain value, sync or async function); the export
@@ -161,9 +187,14 @@ function readProxyMatchers(manifestPath: string): RegExp[] {
 // module needs the ALS global Next's shim expects, then a walk of the
 // loaderTree to the __PAGE__ leaf's module loader. Each generateStaticParams
 // instance resolves to the same module with its own captured params.
-async function pageOverride(serverApp: string, route: string): Promise<ResolvedMd | null> {
+async function pageOverride(
+  serverApp: string,
+  route: string
+): Promise<ResolvedMd | null> {
   const located = locatePageModule(serverApp, route)
-  if (!located) return null
+  if (!located) {
+    return null
+  }
   ;(globalThis as Record<string, unknown>).AsyncLocalStorage ??=
     require("node:async_hooks").AsyncLocalStorage
   try {
@@ -190,7 +221,7 @@ async function pageOverride(serverApp: string, route: string): Promise<ResolvedM
 // tags/[tag]/page.js with { tag: "alpha" }).
 function locatePageModule(
   serverApp: string,
-  route: string,
+  route: string
 ): { pageJs: string; params: Record<string, string> } | null {
   let dir = serverApp
   const params: Record<string, string> = {}
@@ -204,9 +235,11 @@ function locatePageModule(
         entry.isDirectory() &&
         entry.name.startsWith("[") &&
         entry.name.endsWith("]") &&
-        !entry.name.startsWith("[..."),
+        !entry.name.startsWith("[...")
     )
-    if (!dynamic) return null
+    if (!dynamic) {
+      return null
+    }
     params[dynamic.name.slice(1, -1)] = segment
     dir = join(dir, dynamic.name)
   }
@@ -217,42 +250,93 @@ function locatePageModule(
 // Re-runs the user's next config through Next's own loader (which handles TS
 // transpilation) with the capture global set: withText sees it, hands over the
 // llmstxt function, and skips all side effects in that pass.
-async function loadLlmstxt(dir: string): Promise<((ctx: LlmstxtContext) => string) | undefined> {
+async function loadLlmstxt(
+  dir: string
+): Promise<((ctx: LlmstxtContext) => string) | undefined> {
   const capture: { llmstxt?: unknown } = {}
   ;(globalThis as Record<string, unknown>).__NEXT_WITH_TEXT_CAPTURE__ = capture
   try {
     const requireFrom = createRequire(join(dir, "package.json"))
-    const configModule = requireFrom("next/dist/server/config") as { default?: unknown }
+    const configModule = requireFrom("next/dist/server/config") as {
+      default?: unknown
+    }
     const loadConfig = (configModule.default ?? configModule) as (
       phase: string,
-      dir: string,
+      dir: string
     ) => Promise<unknown>
     await loadConfig("phase-production-build", dir)
     return typeof capture.llmstxt === "function"
       ? (capture.llmstxt as (ctx: LlmstxtContext) => string)
       : undefined
   } catch (err) {
-    console.error("[next-with-text] failed to load the llmstxt function from next.config:", err)
-    return undefined
+    console.error(
+      "[next-with-text] failed to load the llmstxt function from next.config:",
+      err
+    )
   } finally {
-    delete (globalThis as Record<string, unknown>).__NEXT_WITH_TEXT_CAPTURE__
+    ;(globalThis as Record<string, unknown>).__NEXT_WITH_TEXT_CAPTURE__ =
+      undefined
   }
 }
 
-// Stale outputs from removed pages are pruned via a manifest of what the last
-// run wrote. It lives in .next/cache (never public/, so it ships nowhere) —
-// cache/ is the one part of .next that next build preserves across builds.
-function prune(dir: string, publicDir: string, written: string[]): void {
+// Outputs the last run wrote are tracked in a manifest of path → content
+// hash, so a rebuild can reclaim files no longer generated (a deleted page's
+// .md, or everything at once when a local build skips the static tier). The
+// hash is the ownership proof: a file the user has since edited by hand no
+// longer matches and is left alone. The manifest lives in .next/cache — never
+// public/, so it ships nowhere, and cache/ is the one part of .next that
+// next build preserves across builds.
+function prune(
+  dir: string,
+  publicDir: string,
+  written: Record<string, string>
+): void {
   const manifestPath = join(dir, ".next", "cache", MANIFEST)
   try {
-    const previous = existsSync(manifestPath)
-      ? (JSON.parse(readFileSync(manifestPath, "utf8")) as string[])
-      : []
-    for (const rel of previous) {
-      if (!written.includes(rel)) rmSync(join(publicDir, rel), { force: true })
+    const previous = readManifest(manifestPath)
+    for (const [rel, hash] of Object.entries(previous)) {
+      if (rel in written) {
+        continue
+      }
+      const target = join(publicDir, rel)
+      if (existsSync(target) && hashOf(readFileSync(target, "utf8")) === hash) {
+        rmSync(target, { force: true })
+        removeEmptyParents(publicDir, dirname(target))
+      }
     }
   } catch {
     // a corrupt manifest just skips pruning for one build
   }
+  mkdirSync(dirname(manifestPath), { recursive: true })
   writeFileSync(manifestPath, JSON.stringify(written, null, 2))
+}
+
+// A pruned .md can leave behind the directory the build made for it (public/
+// tags/, public/blog/…) — walk back up while the folders are empty, stopping
+// at public/ itself and at anything the user still has files in. rmdirSync is
+// non-recursive, so a non-empty directory simply refuses.
+function removeEmptyParents(publicDir: string, from: string): void {
+  let current = from
+  while (current.startsWith(publicDir) && current !== publicDir) {
+    try {
+      rmdirSync(current)
+    } catch {
+      return
+    }
+    current = dirname(current)
+  }
+}
+
+function readManifest(manifestPath: string): Record<string, string> {
+  if (!existsSync(manifestPath)) {
+    return {}
+  }
+  const parsed: unknown = JSON.parse(readFileSync(manifestPath, "utf8"))
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? (parsed as Record<string, string>)
+    : {}
+}
+
+function hashOf(content: string): string {
+  return createHash("sha256").update(content).digest("hex").slice(0, 16)
 }
