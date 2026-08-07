@@ -1,6 +1,6 @@
 # next-with-text
 
-llms.txt for Next.js — one line in `next.config.ts`.
+llms.txt for Next.js — in 3 simple steps.
 
 ```bash
 npm install next-with-text
@@ -13,12 +13,16 @@ import { withText } from "next-with-text";
 export default withText(nextConfig);
 ```
 
+```gitignore
+**/app/%5Fllms/
+```
+
 That's the entire integration. Your app now serves:
 
 - **`/llms.txt`** — a spec-compliant [llmstxt.org](https://llmstxt.org) index of your pages, with real titles and descriptions
 - **`/llms-full.txt`** — every page's full content as markdown, in one file, for bulk ingestion
-- **`/<route>.md`** — a markdown twin of every page (`/about` → `/about.md`)
 - **`Accept: text/markdown`** — agents that ask a canonical URL for markdown get markdown; browsers are unaffected
+- **`/<route>.md`** — a markdown twin of every page (`/about` → `/about.md`)
 
 No route handlers to write, no middleware, no config files, no route lists to maintain. It reads your build output — not your source tree — so nothing it needs disappears in a serverless bundle. ChatGPT, Claude, Perplexity, and coding agents can read your site the way they want to.
 
@@ -26,13 +30,22 @@ Building locally leaves nothing behind: the generated files exist only for the d
 
 Requires Next.js 16+ and the App Router.
 
-## Why this exists
+## Options
 
-AI assistants increasingly decide what to cite by what they can read. Next.js has no first-class way to serve LLM-consumable content, so sites either hand-roll markdown endpoints or reach for tools that scan the source tree and serve title-and-description stubs at best — and a stub is indistinguishable from a broken endpoint to an agent trying to read the page.
+Zero config is the intended config — the same one line works unchanged in every app you ship. When you need more:
 
-`next-with-text` derives everything from your build. It walks the HTML that `next build` actually rendered — `generateMetadata`, `generateStaticParams`, MDX, whatever produced the page — and converts it to clean markdown: headings, code fences, images as absolute-URL references. Dynamic routes like `/blog/[slug]` show up as concrete URLs (`/blog/hello-world`), not patterns. If a page prerenders and isn't excluded, it's in the index.
+```ts
+export default withText(nextConfig, {
+  md: true, // default true — the .md twins + Accept negotiation
+  include: ["**/*"], // route-path globs (routes, not file paths)
+  exclude: [], // excluded routes vanish from every surface: both indexes,
+  // no .md file, and the on-demand route 404s them
+  llmstxt: (ctx) => "…", // optional: its return value IS the entire llms.txt body
+  // ctx is { title, description, sections: [{ title, routes: [{ title, description, href }] }] }
+});
+```
 
-Every surface is asserted by a test suite that builds a real Next app — file-level checks on the build output, HTTP checks against `next start` and `next dev`.
+`llms.txt` and `llms-full.txt` are always generated. The index groups pages by first path segment (`/docs/**` → `## Docs`), root pages listed first — no section config to maintain:
 
 ## Auth safety, by construction
 
@@ -62,23 +75,6 @@ The safety property is unchanged, because the opt-in is an allowlist and everyth
 - **Only literal routes.** `/users/[id]` can't opt in: there are no concrete URLs to publish without enumerating your customers.
 - **`exclude` still wins.** A route matched by an `exclude` pattern stays dark no matter what it exports, so config remains a reliable kill switch.
 - **It's never quiet.** Every build prints the routes that opted in by name: `2 gated route(s) opted into the index via md export: /admin/reports, /gated`.
-
-## Options
-
-Zero config is the intended config — the same one line works unchanged in every app you ship. When you need more:
-
-```ts
-export default withText(nextConfig, {
-  md: true, // default true — the .md twins + Accept negotiation
-  include: ["**/*"], // route-path globs (routes, not file paths)
-  exclude: [], // excluded routes vanish from every surface: both indexes,
-  // no .md file, and the on-demand route 404s them
-  llmstxt: (ctx) => "…", // optional: its return value IS the entire llms.txt body
-  // ctx is { title, description, sections: [{ title, routes: [{ title, description, href }] }] }
-});
-```
-
-`llms.txt` and `llms-full.txt` are always generated. The index groups pages by first path segment (`/docs/**` → `## Docs`), root pages listed first — no section config to maintain:
 
 ```markdown
 # Acme
@@ -117,7 +113,7 @@ export const md: MarkdownPage<"/tags/[tag]"> = async ({ params }) =>
   `# ${(await params).tag}`;
 ```
 
-Functions also receive `searchParams` — real values during on-demand conversion, `{}` at build time.
+Functions also receive `searchParams`, just like standard `PageProps`.
 
 ### Custom index: the `llmstxt` function
 
@@ -131,7 +127,9 @@ llmstxt: ({ title, description, sections }) =>
     ...sections.flatMap((section) => [
       "",
       section.title && `## ${section.title}`,
-      ...section.routes.map((r) => `- [${r.title}](${r.href}): ${r.description}`),
+      ...section.routes.map(
+        (r) => `- [${r.title}](${r.href}): ${r.description}`
+      ),
     ]),
   ]
     .filter(Boolean)
@@ -159,11 +157,15 @@ Local `next start` serves every surface identically — the on-demand route cove
 
 Files you edit by hand are never deleted: pruning removes a file only when its contents still match what the last build wrote.
 
-If a dev server is killed with `SIGKILL` (or your machine loses power), `app/%5Fllms/` can survive — the next build or dev run clears it. Gitignore it if a crash-leftover in `git status` would bother you:
+If a dev server is killed with `SIGKILL` (or your machine loses power), `app/%5Fllms/` can survive — the next build or dev run clears it.
 
-```gitignore
-app/%5Fllms/
-```
+## Why this exists
+
+AI assistants increasingly decide what to cite by what they can read. Next.js has no first-class way to serve LLM-consumable content, so sites either hand-roll markdown endpoints or reach for tools that scan the source tree and serve title-and-description stubs at best — and a stub is indistinguishable from a broken endpoint to an agent trying to read the page.
+
+`next-with-text` derives everything from your build. It walks the HTML that `next build` actually rendered — `generateMetadata`, `generateStaticParams`, MDX, whatever produced the page — and converts it to clean markdown: headings, code fences, images as absolute-URL references. Dynamic routes like `/blog/[slug]` show up as concrete URLs (`/blog/hello-world`), not patterns. If a page prerenders and isn't excluded, it's in the index.
+
+Every surface is asserted by a test suite that builds a real Next app — file-level checks on the build output, HTTP checks against `next start` and `next dev`.
 
 ## What it's not for
 
