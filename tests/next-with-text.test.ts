@@ -74,6 +74,7 @@ const NEVER_GENERATED = [
 function cleanFixture(): void {
   rmSync(join(FIXTURE, ".next"), { force: true, recursive: true })
   rmSync(join(FIXTURE, "app", "%5Fllms"), { force: true, recursive: true })
+  rmSync(join(FIXTURE, "adapter-probe.json"), { force: true })
   for (const rel of [...GENERATED, ...NEVER_GENERATED]) {
     rmSync(join(PUBLIC, rel), { force: true })
   }
@@ -344,21 +345,29 @@ describe("next build", () => {
     // what an earlier build would have left at a route that now publishes no
     // body — it must be reclaimed, or it shadows the live per-requester render
     writeFileSync(join(PUBLIC, "gated.md"), "STALE_GATED: captured render\n")
-    await buildFixture()
+    await buildFixture({
+      NEXT_ADAPTER_PATH: join(FIXTURE, "adapter-probe.cjs"),
+    })
   })
 
   const read = (rel: string) => readFileSync(join(PUBLIC, rel), "utf8")
 
-  test("the generated app/%5Fllms route is gone once the build finishes", () => {
-    expect(existsSync(join(FIXTURE, "app", "%5Fllms"))).toBe(false)
+  test("the generated app/%5Fllms route remains for deployment collection", () => {
+    expect(existsSync(join(FIXTURE, "app", "%5Fllms"))).toBe(true)
   })
 
-  test("typegen keeps no dangling reference to the deleted route — tsc stays clean", () => {
+  test("the deployment adapter sees the generated route and static files", () => {
+    expect(
+      JSON.parse(readFileSync(join(FIXTURE, "adapter-probe.json"), "utf8"))
+    ).toEqual({ route: true, static: true })
+  })
+
+  test("typegen keeps its reference to the retained route — tsc stays clean", () => {
     const validator = readFileSync(
       join(FIXTURE, ".next", "types", "validator.ts"),
       "utf8"
     )
-    expect(validator).not.toContain("%5Fllms")
+    expect(validator).toContain("%5Fllms")
     const tsc = spawnSync(["bunx", "tsc", "--noEmit"], { cwd: FIXTURE })
     expect(tsc.stdout.toString() + tsc.stderr.toString()).toBe("")
     expect(tsc.exitCode).toBe(0)

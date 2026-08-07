@@ -36,7 +36,7 @@
     "src"
   ],
   "scripts": {
-    "build": "bun build src/index.ts --target=node --format=cjs --outfile=dist/index.cjs --packages=external && bun build src/patch.ts --target=node --format=cjs --outfile=dist/patch.cjs --external=@xberg-io/html-to-markdown && bun build src/route.ts --target=node --format=esm --outfile=dist/route.js --external=@xberg-io/html-to-markdown",
+    "build": "bun build src/index.ts --target=node --format=cjs --outfile=dist/index.cjs --packages=external && bun build src/adapter.ts --target=node --format=cjs --outfile=dist/adapter.cjs --packages=external && bun build src/patch.ts --target=node --format=cjs --outfile=dist/patch.cjs --external=@xberg-io/html-to-markdown && bun build src/route.ts --target=node --format=esm --outfile=dist/route.js --external=@xberg-io/html-to-markdown",
     "check": "ultracite check",
     "fix": "ultracite fix",
     "prepack": "bun run build",

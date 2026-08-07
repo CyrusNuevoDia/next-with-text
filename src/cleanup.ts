@@ -65,10 +65,9 @@ function claimed(dir: string): boolean {
   }
 }
 
-// The codegen'd app/%5Fllms route is scaffolding: the build compiles it into
-// .next (which is what start/serverless serve) and dev compiles it live, so
-// once the owning process exits the source folder is dead weight — delete it
-// rather than leave generated noise in the user's app tree.
+// Dev compiles the codegen'd route live, then deletes it when the server exits
+// so generated scaffolding does not linger in the working tree. Production
+// builds retain it because deployment collectors can trace the source path.
 export function cleanupGeneratedRoute(dir: string): void {
   const appDir = ["src/app", "app"].map((d) => join(dir, d)).find(existsSync)
   if (!appDir || claimed(dir)) {
