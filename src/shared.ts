@@ -9,6 +9,7 @@ import multimatch from "multimatch"
 
 const IMAGE_TAG = /<img\b[^>]*>/gi
 const SRC_ATTRIBUTE = /\ssrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i
+const SVG_TAG = /<svg\b[\s\S]*?<\/svg\s*>/gi
 const DATA_URL = /^data:/i
 const WORD_SEPARATOR = /[-_]/
 
@@ -351,11 +352,11 @@ export function matchPattern(
 export const CONVERT_OPTIONS = { excludeSelectors: ["footer"] }
 
 export function convertHTML(html: string): ConversionResult {
-  return convert(stripPathlessImages(html), CONVERT_OPTIONS)
+  return convert(stripInlineImages(html), CONVERT_OPTIONS)
 }
 
-function stripPathlessImages(html: string): string {
-  return html.replace(IMAGE_TAG, (image) => {
+function stripInlineImages(html: string): string {
+  return html.replace(SVG_TAG, "").replace(IMAGE_TAG, (image) => {
     const src = image.match(SRC_ATTRIBUTE)
     const path = src?.[1] ?? src?.[2] ?? src?.[3]
     return path && !DATA_URL.test(path) ? image : ""

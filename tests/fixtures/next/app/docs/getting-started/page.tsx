@@ -18,6 +18,9 @@ export default function GettingStarted() {
         width={1}
       />
       <img alt="Missing source" height={1} width={1} />
+      <svg aria-label="Inline chart" viewBox="0 0 10 10">
+        <circle cx="5" cy="5" r="4" />
+      </svg>
       <h2>Install</h2>
       <p>
         Run <code>bun install</code> first.

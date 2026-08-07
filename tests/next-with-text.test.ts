@@ -257,6 +257,7 @@ describe("next dev", () => {
     expect(body).toContain("![The team](/images/team.png)")
     expect(body).not.toContain("Inline avatar")
     expect(body).not.toContain("Missing source")
+    expect(body).not.toContain("SVG Image")
     expect(body).not.toContain("<article")
     expect(body).not.toContain("data:image")
   })
@@ -558,6 +559,7 @@ describe("next build", () => {
     expect(page).toContain("![The team](/images/team.png)")
     expect(page).not.toContain("Inline avatar")
     expect(page).not.toContain("Missing source")
+    expect(page).not.toContain("SVG Image")
     for (const rel of GENERATED) {
       expect(read(rel)).not.toContain("data:image")
     }
