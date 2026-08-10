@@ -31,6 +31,15 @@ Building locally leaves nothing behind: the generated files exist only for the d
 
 Requires Next.js 16+ and the App Router.
 
+## How it works
+
+`withText` hooks into the Next.js build and generates a private catch-all route. From there, the package has two paths that produce the same markdown:
+
+1. **At build time**, it reads the prerendered HTML in `.next/server/app`, discovers the concrete routes Next actually emitted, converts each page to markdown, and writes `llms.txt`, `llms-full.txt`, and the per-page `.md` files into the deploy artifact. Metadata and `export const md` overrides are applied before the files are grouped and rendered.
+2. **At request time**, the generated route serves the same surfaces when a static file is unavailable, including during development. For a dynamic `.md` request it evaluates the page's `md` export when present; otherwise it fetches the page from the same deployment, forwards the visitor's cookies, and converts the returned HTML to markdown.
+
+This split is also the auth boundary. The static path only sees pages Next prerendered, then removes routes covered by compiled proxy matchers, so private rendered HTML never enters a deploy artifact. A dynamic request renders with the caller's own session and returns `Cache-Control: private, no-store`; a gated page reaches the public indexes only when its source explicitly exports publishable `md` metadata or content.
+
 ## Options
 
 Zero config is the intended config — the same one line works unchanged in every app you ship. When you need more:
