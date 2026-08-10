@@ -14,6 +14,11 @@ import {
   releaseGeneratedRoute,
 } from "./cleanup"
 import {
+  appDir as findAppDir,
+  userAppRoutes,
+  userPublicFile,
+} from "./ownership"
+import {
   isPageFile,
   type ResolvedOptions,
   type RouteOptions,
@@ -88,6 +93,7 @@ export function withText(
     }
 
     const dir = process.cwd()
+    const appRoutes = userAppRoutes(dir)
     if (phase === PHASE_BUILD || phase === PHASE_DEV) {
       generateRoute(dir, { ...resolved, dev: phase === PHASE_DEV })
     }
@@ -141,7 +147,7 @@ export function withText(
 
     const config: NextConfig = {
       ...base,
-      rewrites: composeRewrites(base.rewrites, resolved),
+      rewrites: composeRewrites(base.rewrites, resolved, dir, appRoutes),
       // the converter is a native addon — Turbopack can't bundle it into the
       // generated route handler
       serverExternalPackages: [
@@ -162,7 +168,7 @@ export function withText(
 }
 
 function generateRoute(dir: string, options: RouteOptions): void {
-  const appDir = ["src/app", "app"].map((d) => join(dir, d)).find(existsSync)
+  const appDir = findAppDir(dir)
   if (!appDir) {
     return
   }
@@ -268,7 +274,9 @@ type RewriteRule =
 
 function composeRewrites(
   userRewrites: NextConfig["rewrites"],
-  options: ResolvedOptions
+  options: ResolvedOptions,
+  dir: string,
+  appRoutes: Set<string>
 ): RewritesFn {
   return async () => {
     const user = userRewrites ? await userRewrites() : []
@@ -304,17 +312,33 @@ function composeRewrites(
       // afterFiles runs after public files (a static .md still wins) but before
       // dynamic routes — a fallback rewrite would lose /tags/alpha.md to the
       // /tags/[tag] page itself.
+      const customMd = [...appRoutes]
+        .filter((route) => route.endsWith(".md"))
+        .map(escapeRegex)
       afterFiles.push({
         destination: "/_llms/:path",
-        source: "/:path(.*\\.md)",
+        source:
+          customMd.length === 0
+            ? "/:path(.*\\.md)"
+            : `/:path((?!(?:${customMd.join("|")})$).*\\.md)`,
       })
     }
-    afterFiles.push({ destination: "/_llms/llms.txt", source: "/llms.txt" })
-    afterFiles.push({
-      destination: "/_llms/llms-full.txt",
-      source: "/llms-full.txt",
-    })
+    if (!(appRoutes.has("llms.txt") || userPublicFile(dir, "llms.txt"))) {
+      afterFiles.push({ destination: "/_llms/llms.txt", source: "/llms.txt" })
+    }
+    if (
+      !(appRoutes.has("llms-full.txt") || userPublicFile(dir, "llms-full.txt"))
+    ) {
+      afterFiles.push({
+        destination: "/_llms/llms-full.txt",
+        source: "/llms-full.txt",
+      })
+    }
 
     return { afterFiles, beforeFiles, fallback: groups.fallback }
   }
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }

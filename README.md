@@ -48,7 +48,7 @@ export default withText(nextConfig, {
 });
 ```
 
-`llms.txt` and `llms-full.txt` are always generated. The index groups pages by first path segment (`/docs/**` → `## Docs`), root pages listed first — no section config to maintain:
+`llms.txt` and `llms-full.txt` are generated unless your app already owns that route. The index groups pages by first path segment (`/docs/**` → `## Docs`), root pages listed first — no section config to maintain:
 
 ## Auth safety, by construction
 
@@ -181,6 +181,8 @@ The same variable set to `0` forces local behavior anywhere, including CI. With 
 Local `next start` serves every surface identically — the on-demand route covers what the static files would have. It's a request-time HTML conversion rather than a file read, so it's slower than production, and it's the only difference you'll see.
 
 Files you edit by hand are never deleted: pruning removes a file only when its contents still match what the last build wrote.
+
+Existing surfaces always win. A file such as `public/llms.txt`, or an exact App Router handler such as `app/llms-full.txt/route.ts` or `app/about.md/route.ts`, makes next-with-text skip that output entirely — it doesn't render the body, invoke its customization callback, write a static file, or install a rewrite over your route. This applies independently to both indexes and every per-page `.md` twin. Files recorded in the build manifest are still next-with-text outputs, so later builds update them normally; editing one by hand transfers ownership to you. A custom per-page `.md` route remains linked from `llms.txt`, and `llms-full.txt` references it instead of publishing a second rendering of the underlying page.
 
 If a dev server is killed with `SIGKILL` (or your machine loses power), `app/%5Fllms/` can survive — the next build or dev run clears it.
 

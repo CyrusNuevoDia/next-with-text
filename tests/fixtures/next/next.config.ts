@@ -1,3 +1,5 @@
+import { writeFileSync } from "node:fs"
+import { join } from "node:path"
 import { type WithTextOptions, withText } from "next-with-text"
 
 const options: WithTextOptions = { exclude: ["/docs/internal/**"] }
@@ -13,6 +15,12 @@ if (process.env.LLMSTXT_FN === "1") {
       ]),
     ].join("\n")
 }
+if (process.env.LLMSTXT_FN === "throw") {
+  options.llmstxt = () => {
+    writeFileSync(join(process.cwd(), "llmstxt-invoked"), "yes")
+    return "unexpected generated index"
+  }
+}
 if (process.env.LLMSFULLTXT_FN === "1") {
   options.llmsfulltxt = ({ title, description, sections }) =>
     [
@@ -24,6 +32,12 @@ if (process.env.LLMSFULLTXT_FN === "1") {
         ),
       ]),
     ].join("\n")
+}
+if (process.env.LLMSFULLTXT_FN === "track") {
+  options.llmsfulltxt = () => {
+    writeFileSync(join(process.cwd(), "llmsfulltxt-invoked"), "yes")
+    return "unexpected generated full text"
+  }
 }
 if (process.env.MD_OFF === "1") {
   options.md = false

@@ -3,7 +3,6 @@
 // list, so auth-gated dynamic pages are absent by construction — and writes
 // the static surfaces into public/.
 
-import { createHash } from "node:crypto"
 import {
   existsSync,
   mkdirSync,
@@ -15,6 +14,12 @@ import {
 } from "node:fs"
 import { createRequire } from "node:module"
 import { dirname, join } from "node:path"
+import {
+  generatedManifest,
+  hashOf,
+  userAppRoutes,
+  userPublicFile,
+} from "./ownership"
 import {
   compareCodeUnits,
   convertHTML,
@@ -86,8 +91,30 @@ async function main({
     .filter((route) => matchesRoute(route, options))
     .sort(compareCodeUnits)
 
+  const appRoutes = userAppRoutes(dir)
+  const manifest = generatedManifest(dir)
+  const ownedByUser = (rel: string) =>
+    appRoutes.has(rel) || userPublicFile(dir, rel, manifest)
+  const needsIndex = !ownedByUser("llms.txt")
+  const needsFull = !ownedByUser("llms-full.txt")
+  let routesToBuild = routes
+  if (!(needsIndex || needsFull)) {
+    routesToBuild = options.md
+      ? routes.filter(
+          (route) =>
+            !ownedByUser(route === "/" ? "index.md" : `${route.slice(1)}.md`)
+        )
+      : []
+  }
+
+  const publicDir = join(dir, "public")
+  if (!(needsIndex || needsFull) && routesToBuild.length === 0) {
+    prune(dir, publicDir, {})
+    console.log("[next-with-text] existing routes own every enabled surface")
+    return
+  }
   const builtPages = await Promise.all(
-    routes.map((route) => buildPage(serverApp, route, gatedRoute(route)))
+    routesToBuild.map((route) => buildPage(serverApp, route, gatedRoute(route)))
   )
   const pages = builtPages.filter((page): page is Page => page !== null)
   const optedIn = pages
@@ -116,10 +143,10 @@ async function main({
     hasLlmstxt,
     pages,
     site,
-    links
+    links,
+    ownedByUser
   )
 
-  const publicDir = join(dir, "public")
   // The public/ tier is a deploy artifact: local builds skip it (the on-demand
   // route serves everything under next start) so the working tree stays clean,
   // and prune() below removes leftovers from an earlier deploy-shaped build.
@@ -137,7 +164,8 @@ async function main({
   reclaimShadowed(
     [publicDir, ...(existsSync(standalonePublic) ? [standalonePublic] : [])],
     pages,
-    options.md
+    options.md,
+    ownedByUser
   )
   prune(dir, publicDir, written)
   console.log(
@@ -154,7 +182,8 @@ async function buildWrites(
   hasLlmstxt: boolean,
   pages: Page[],
   site: PageMeta,
-  links: Link[]
+  links: Link[],
+  ownedByUser: (rel: string) => boolean
 ): Promise<[rel: string, content: string][]> {
   const writes: [rel: string, content: string][] = options.md
     ? pages.flatMap((page) => {
@@ -163,6 +192,9 @@ async function buildWrites(
         }
         const rel =
           page.route === "/" ? "index.md" : `${page.route.slice(1)}.md`
+        if (ownedByUser(rel)) {
+          return []
+        }
         const content = page.content.endsWith("\n")
           ? page.content
           : `${page.content}\n`
@@ -171,35 +203,58 @@ async function buildWrites(
     : []
   // Functions can't cross into this process as JSON — re-load the user's next
   // config in capture mode to reach them; each return IS its entire file body.
-  const templates = hasLlmstxt || hasLlmsfulltxt ? await loadTemplates(dir) : {}
-  writes.push([
-    "llms.txt",
-    templates.llmstxt
-      ? templates.llmstxt({
-          description: site.description,
-          sections: llmstxtSections(links, options.md),
-          title: site.title,
-        })
-      : renderIndex(site, links, options.md),
-  ])
+  const renderLlmstxt = !ownedByUser("llms.txt")
+  const renderLlmsfulltxt = !ownedByUser("llms-full.txt")
+  const templates =
+    (renderLlmstxt && hasLlmstxt) || (renderLlmsfulltxt && hasLlmsfulltxt)
+      ? await loadTemplates(dir)
+      : {}
+  if (renderLlmstxt) {
+    writes.push([
+      "llms.txt",
+      templates.llmstxt
+        ? templates.llmstxt({
+            description: site.description,
+            sections: llmstxtSections(links, options.md),
+            title: site.title,
+          })
+        : renderIndex(site, links, options.md),
+    ])
+  }
   const byRoute = new Map(pages.map((page) => [page.route, page]))
   const content = (link: Link) => {
     const pageContent = byRoute.get(link.route)?.content
+    const rel = link.route === "/" ? "index.md" : `${link.route.slice(1)}.md`
+    if (ownedByUser(rel)) {
+      return renderExistingMarkdown(link)
+    }
     return pageContent === null || pageContent === undefined
       ? renderStub(link, options.md)
       : stripFrontmatter(pageContent).trim()
   }
-  writes.push([
-    "llms-full.txt",
-    templates.llmsfulltxt
-      ? templates.llmsfulltxt({
-          description: site.description,
-          sections: llmsfulltxtSections(links, options.md, content),
-          title: site.title,
-        })
-      : renderFull(site, orderLinks(links).map(content)),
-  ])
+  if (renderLlmsfulltxt) {
+    writes.push([
+      "llms-full.txt",
+      templates.llmsfulltxt
+        ? templates.llmsfulltxt({
+            description: site.description,
+            sections: llmsfulltxtSections(links, options.md, content),
+            title: site.title,
+          })
+        : renderFull(site, orderLinks(links).map(content)),
+    ])
+  }
   return writes
+}
+
+function renderExistingMarkdown(link: Link): string {
+  const parts = [`# ${link.title}`.trimEnd()]
+  if (link.description) {
+    parts.push(`> ${link.description}`)
+  }
+  const href = link.route === "/" ? "/index.md" : `${link.route}.md`
+  parts.push(`[Read markdown](${href})`)
+  return parts.join("\n\n")
 }
 
 function writeOutputs(
@@ -256,7 +311,8 @@ async function buildPage(
 function reclaimShadowed(
   bases: string[],
   pages: Page[],
-  mdEnabled: boolean
+  mdEnabled: boolean,
+  ownedByUser: (rel: string) => boolean
 ): void {
   if (!mdEnabled) {
     return
@@ -266,6 +322,9 @@ function reclaimShadowed(
       continue
     }
     const rel = page.route === "/" ? "index.md" : `${page.route.slice(1)}.md`
+    if (ownedByUser(rel)) {
+      continue
+    }
     let removed = false
     for (const base of bases) {
       const target = join(base, rel)
@@ -442,7 +501,7 @@ function prune(
 ): void {
   const manifestPath = join(dir, ".next", "cache", MANIFEST)
   try {
-    const previous = readManifest(manifestPath)
+    const previous = generatedManifest(dir)
     for (const [rel, hash] of Object.entries(previous)) {
       if (rel in written) {
         continue
@@ -474,18 +533,4 @@ function removeEmptyParents(publicDir: string, from: string): void {
     }
     current = dirname(current)
   }
-}
-
-function readManifest(manifestPath: string): Record<string, string> {
-  if (!existsSync(manifestPath)) {
-    return {}
-  }
-  const parsed: unknown = JSON.parse(readFileSync(manifestPath, "utf8"))
-  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-    ? (parsed as Record<string, string>)
-    : {}
-}
-
-function hashOf(content: string): string {
-  return createHash("sha256").update(content).digest("hex").slice(0, 16)
 }

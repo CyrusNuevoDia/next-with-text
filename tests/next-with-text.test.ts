@@ -17,6 +17,7 @@ import {
   setDefaultTimeout,
   test,
 } from "bun:test"
+import { createHash } from "node:crypto"
 import {
   existsSync,
   mkdirSync,
@@ -39,12 +40,14 @@ const PUBLIC = join(FIXTURE, "public")
 const DEV_PORT = 4311
 const START_PORT = 4312
 const LOCAL_START_PORT = 4313
+const CUSTOM_START_PORT = 4314
 const INDEX_LINK = /^- \[.+\]\(\/[^)]+\.md\): .+$/
 
 // the prune ownership probe: a generated file the user edits afterwards must
 // survive the local build that reclaims everything else
 const HAND_EDITED = "docs/api/auth.md"
 const HAND_EDIT = "hand-edited, not ours to delete\n"
+const STALE_GATED = "STALE_GATED: captured render\n"
 
 const GENERATED = [
   "index.md",
@@ -75,7 +78,17 @@ const NEVER_GENERATED = [
 function cleanFixture(): void {
   rmSync(join(FIXTURE, ".next"), { force: true, recursive: true })
   rmSync(join(FIXTURE, "app", "%5Fllms"), { force: true, recursive: true })
+  rmSync(join(FIXTURE, "app", "llms-full.txt"), {
+    force: true,
+    recursive: true,
+  })
+  rmSync(join(FIXTURE, "app", "about.md"), {
+    force: true,
+    recursive: true,
+  })
   rmSync(join(FIXTURE, "adapter-probe.json"), { force: true })
+  rmSync(join(FIXTURE, "llmstxt-invoked"), { force: true })
+  rmSync(join(FIXTURE, "llmsfulltxt-invoked"), { force: true })
   for (const rel of [...GENERATED, ...NEVER_GENERATED]) {
     rmSync(join(PUBLIC, rel), { force: true })
   }
@@ -358,7 +371,18 @@ describe("next build", () => {
     // what an earlier build would have left at a route that now publishes no
     // body — it must be reclaimed, or it shadows the live per-requester render
     mkdirSync(PUBLIC, { recursive: true })
-    writeFileSync(join(PUBLIC, "gated.md"), "STALE_GATED: captured render\n")
+    writeFileSync(join(PUBLIC, "gated.md"), STALE_GATED)
+    const manifestDir = join(FIXTURE, ".next", "cache")
+    mkdirSync(manifestDir, { recursive: true })
+    writeFileSync(
+      join(manifestDir, "next-with-text-manifest.json"),
+      JSON.stringify({
+        "gated.md": createHash("sha256")
+          .update(STALE_GATED)
+          .digest("hex")
+          .slice(0, 16),
+      })
+    )
     await buildFixture({
       NEXT_ADAPTER_PATH: join(FIXTURE, "adapter-probe.cjs"),
     })
@@ -846,6 +870,91 @@ describe("llmsfulltxt function build", () => {
   })
 })
 
+describe("existing llms surfaces", () => {
+  const custom = "# Hand-authored llms.txt\n"
+  const fullRoute = join(FIXTURE, "app", "llms-full.txt")
+  const aboutRoute = join(FIXTURE, "app", "about.md")
+  let server: Server
+
+  beforeAll(async () => {
+    cleanFixture()
+    await buildFixture()
+    expect(existsSync(join(PUBLIC, "about.md"))).toBe(true)
+    mkdirSync(PUBLIC, { recursive: true })
+    writeFileSync(join(PUBLIC, "llms.txt"), custom)
+    for (const [dir, body] of [
+      [fullRoute, "custom full text"],
+      [aboutRoute, "custom about markdown"],
+    ]) {
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(
+        join(dir, "route.ts"),
+        `export const GET = () => new Response(${JSON.stringify(body)})\n`
+      )
+    }
+    await buildFixture({
+      LLMSFULLTXT_FN: "track",
+      LLMSTXT_FN: "throw",
+    })
+    server = await startServer(["start"], CUSTOM_START_PORT)
+  })
+
+  afterAll(async () => {
+    await server.stop()
+    rmSync(fullRoute, { force: true, recursive: true })
+    rmSync(aboutRoute, { force: true, recursive: true })
+    rmSync(join(PUBLIC, "llms.txt"), { force: true })
+    await buildFixture({ LLMSFULLTXT_FN: "1" })
+  })
+
+  test("preserves the existing file without invoking its generator", () => {
+    expect(readFileSync(join(PUBLIC, "llms.txt"), "utf8")).toBe(custom)
+    expect(existsSync(join(FIXTURE, "llmstxt-invoked"))).toBe(false)
+  })
+
+  test("serves exact App Router routes without generating over them", async () => {
+    expect(existsSync(join(PUBLIC, "llms-full.txt"))).toBe(false)
+    expect(existsSync(join(PUBLIC, "about.md"))).toBe(false)
+    expect(existsSync(join(FIXTURE, "llmsfulltxt-invoked"))).toBe(false)
+    expect(await (await get(CUSTOM_START_PORT, "/llms-full.txt")).text()).toBe(
+      "custom full text"
+    )
+    expect(await (await get(CUSTOM_START_PORT, "/about.md")).text()).toBe(
+      "custom about markdown"
+    )
+  })
+})
+
+describe("existing per-page markdown", () => {
+  const aboutRoute = join(FIXTURE, "app", "about.md")
+
+  beforeAll(async () => {
+    cleanFixture()
+    mkdirSync(aboutRoute, { recursive: true })
+    writeFileSync(
+      join(aboutRoute, "route.ts"),
+      'export const GET = () => new Response("custom about markdown")\n'
+    )
+    await buildFixture()
+  })
+
+  afterAll(async () => {
+    rmSync(aboutRoute, { force: true, recursive: true })
+    await buildFixture({ LLMSFULLTXT_FN: "1" })
+  })
+
+  test("indexes the existing route without generating competing content", () => {
+    expect(existsSync(join(PUBLIC, "about.md"))).toBe(false)
+    expect(readFileSync(join(PUBLIC, "llms.txt"), "utf8")).toContain(
+      "](/about.md)"
+    )
+    const full = readFileSync(join(PUBLIC, "llms-full.txt"), "utf8")
+    expect(full).toContain("[Read markdown](/about.md)")
+    expect(full).not.toContain("MD_OVERRIDE_ABOUT")
+    expect(full).not.toContain("SENTINEL_ABOUT")
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Local builds — no deploy env (CI/VERCEL unset): the static tier is skipped,
 // leftovers from earlier deploy builds are pruned, and next start serves every
@@ -858,6 +967,7 @@ describe("local build — no deploy env", () => {
   beforeAll(async () => {
     // the llmstxt describe just left deploy-built files in public/ — this
     // build must remove them and add nothing new
+    mkdirSync(join(PUBLIC, "docs", "api"), { recursive: true })
     writeFileSync(join(PUBLIC, HAND_EDITED), HAND_EDIT)
     await buildFixture({ CI: "", VERCEL: "" })
     server = await startServer(["start"], LOCAL_START_PORT)
