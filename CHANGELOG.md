@@ -1,5 +1,11 @@
 # next-with-text
 
+## 0.3.1
+
+### Patch Changes
+
+- fc0f031: Preserve existing public files and exact App Router routes instead of generating or rewriting over their llms.txt, llms-full.txt, and per-page Markdown surfaces.
+
 ## 0.3.0
 
 ### Minor Changes
