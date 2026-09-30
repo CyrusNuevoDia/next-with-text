@@ -424,6 +424,24 @@ describe("next build", () => {
     expect(tsc.exitCode).toBe(0)
   })
 
+  test("a header-conditional proxy matcher excludes nothing; a path matcher still does", () => {
+    // the fixture proxy pairs /admin/:path* with a has: accept matcher on
+    // /:path* — only the unconditional one may keep routes out
+    const manifest = readFileSync(
+      join(FIXTURE, ".next", "server", "functions-config-manifest.json"),
+      "utf8"
+    )
+    expect(manifest).toContain('"has"')
+    const index = read("llms.txt")
+    expect(index).toContain("](/about.md)")
+    expect(index).toContain("](/docs/getting-started.md)")
+    for (const rel of GENERATED) {
+      expect(`${existsSync(join(PUBLIC, rel))} ${rel}`).toBe(`true ${rel}`)
+    }
+    expect(index).not.toContain("(/admin.md)")
+    expect(existsSync(join(PUBLIC, "admin.md"))).toBe(false)
+  })
+
   test("check 1: every included prerendered page got its file, nothing else", () => {
     for (const rel of GENERATED) {
       expect(existsSync(join(PUBLIC, rel))).toBe(true)

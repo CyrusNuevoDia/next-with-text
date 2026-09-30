@@ -568,6 +568,12 @@ export function discoverModuleRoutes(dir: string): string[] {
 // empty, and dev writes no such manifest (so dev applies no proxy exclusion,
 // same as it always has). The path is a literal-suffixed join so Turbopack can
 // scope its tracing to .next instead of the whole project.
+type ProxyMatcher = {
+  has?: unknown[]
+  missing?: unknown[]
+  regexp: string
+}
+
 export function readProxyMatchers(dir: string): RegExp[] {
   const manifestPath = join(dir, ".next/server/functions-config-manifest.json")
   try {
@@ -575,10 +581,14 @@ export function readProxyMatchers(dir: string): RegExp[] {
       return []
     }
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
-      functions?: Record<string, { matchers?: Array<{ regexp: string }> }>
+      functions?: Record<string, { matchers?: ProxyMatcher[] }>
     }
+    // A matcher with has/missing conditions runs the proxy only for some
+    // requests (a header, cookie, or query), so it guards no route outright —
+    // `has: accept` alone would otherwise exclude every page.
     return Object.values(manifest.functions ?? {})
       .flatMap((fn) => fn.matchers ?? [])
+      .filter((matcher) => !(matcher.has?.length || matcher.missing?.length))
       .map((matcher) => new RegExp(matcher.regexp))
   } catch {
     // a corrupt manifest just skips exclusion for this build
