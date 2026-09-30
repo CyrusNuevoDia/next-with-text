@@ -120,9 +120,10 @@ function evaluateOverride(
       return null
     }
     const params = matchPattern(route, pattern)
-    if (params) {
+    const load = loaders[pattern]
+    if (params && load) {
       try {
-        const mod = (await loaders[pattern]()) as { md?: unknown }
+        const mod = (await load()) as { md?: unknown }
         const value = await evaluateMd(mod.md, params, searchParams)
         if (value) {
           return value
@@ -335,7 +336,7 @@ function searchParamsOf(req: Request): Record<string, string | string[]> {
   const result: Record<string, string | string[]> = {}
   for (const key of searchParams.keys()) {
     const values = searchParams.getAll(key)
-    result[key] = values.length > 1 ? values : values[0]
+    result[key] = values.length > 1 ? values : (values[0] ?? "")
   }
   return result
 }

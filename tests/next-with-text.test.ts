@@ -224,7 +224,7 @@ function assertOrder(body: string, ...needles: string[]): void {
     return at
   })
   for (let i = 1; i < positions.length; i += 1) {
-    expect(positions[i]).toBeGreaterThan(positions[i - 1])
+    expect(positions[i]).toBeGreaterThan(positions[i - 1] ?? -1)
   }
 }
 
@@ -885,7 +885,7 @@ describe("existing llms surfaces", () => {
     for (const [dir, body] of [
       [fullRoute, "custom full text"],
       [aboutRoute, "custom about markdown"],
-    ]) {
+    ] as const) {
       mkdirSync(dir, { recursive: true })
       writeFileSync(
         join(dir, "route.ts"),

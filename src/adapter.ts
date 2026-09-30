@@ -1,6 +1,10 @@
 import { spawnSync } from "node:child_process"
 import { dirname, join } from "node:path"
-import type { NextAdapter, NextConfigComplete } from "next"
+import type { NextAdapter } from "next"
+
+type NextConfigComplete = Parameters<
+  NonNullable<NextAdapter["modifyConfig"]>
+>[0]
 
 const upstreamPath = process.env.NEXT_WITH_TEXT_UPSTREAM_ADAPTER
 const moduleDir = dirname(require.resolve("next-with-text"))

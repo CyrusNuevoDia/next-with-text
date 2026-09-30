@@ -40,7 +40,7 @@
     "check": "ultracite check",
     "fix": "ultracite fix",
     "prepack": "bun run build",
-    "test": "bun run build && bun test"
+    "test": "bun run build && tsc --noEmit && bun test"
   },
   "dependencies": {
     "@xberg-io/html-to-markdown": "^3.10.6",
@@ -52,6 +52,7 @@
     "@types/bun": "latest",
     "@types/node": "^24",
     "next": "latest",
+    "typescript": "^6.0.3",
     "ultracite": "7.10.1"
   },
   "peerDependencies": {

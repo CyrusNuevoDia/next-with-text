@@ -183,11 +183,11 @@ export function groupLinks(links: Link[]): {
   const root = sorted.filter((link) => segmentsOf(link.route).length <= 1)
   const bySegment = new Map<string, Link[]>()
   for (const link of sorted) {
-    const segments = segmentsOf(link.route)
-    if (segments.length <= 1) {
+    const [first, ...rest] = segmentsOf(link.route)
+    if (first === undefined || rest.length === 0) {
       continue
     }
-    bySegment.set(segments[0], [...(bySegment.get(segments[0]) ?? []), link])
+    bySegment.set(first, [...(bySegment.get(first) ?? []), link])
   }
   const sections = [...bySegment.entries()]
     .sort(([a], [b]) => compareCodeUnits(a, b))
@@ -369,15 +369,15 @@ export function matchPattern(
     return null
   }
   const params: Record<string, string> = {}
-  for (let i = 0; i < patternSegments.length; i += 1) {
-    const segment = patternSegments[i]
+  for (const [i, segment] of patternSegments.entries()) {
+    const routeSegment = routeSegments[i] ?? ""
     if (
       segment.startsWith("[") &&
       segment.endsWith("]") &&
       !segment.startsWith("[...")
     ) {
-      params[segment.slice(1, -1)] = decodeURIComponent(routeSegments[i])
-    } else if (segment !== routeSegments[i]) {
+      params[segment.slice(1, -1)] = decodeURIComponent(routeSegment)
+    } else if (segment !== routeSegment) {
       return null
     }
   }
