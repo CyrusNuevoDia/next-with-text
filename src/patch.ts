@@ -19,7 +19,7 @@ import {
   hashOf,
   userAppRoutes,
   userPublicFile,
-} from "./ownership"
+} from "./ownership.js"
 import {
   compareCodeUnits,
   convertHTML,
@@ -43,7 +43,7 @@ import {
   renderIndex,
   renderStub,
   stripFrontmatter,
-} from "./shared"
+} from "./shared.js"
 
 const MANIFEST = "next-with-text-manifest.json"
 

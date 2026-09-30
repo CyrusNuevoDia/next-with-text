@@ -12,19 +12,19 @@ import {
   claimGeneratedRoute,
   cleanupGeneratedRoute,
   releaseGeneratedRoute,
-} from "./cleanup"
+} from "./cleanup.js"
 import {
   appDir as findAppDir,
   userAppRoutes,
   userPublicFile,
-} from "./ownership"
+} from "./ownership.js"
 import {
   isPageFile,
   type ResolvedOptions,
   type RouteOptions,
   resolveOptions,
   type WithTextOptions,
-} from "./shared"
+} from "./shared.js"
 
 const moduleDir = dirname(require.resolve("next-with-text"))
 
@@ -35,7 +35,7 @@ export type {
   MarkdownPage,
   MarkdownProps,
   WithTextOptions,
-} from "./shared"
+} from "./shared.js"
 
 type ConfigContext = {
   defaultConfig?: NextConfig

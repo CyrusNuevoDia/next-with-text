@@ -20,7 +20,7 @@ import {
   renderIndex,
   renderStub,
   stripFrontmatter,
-} from "./shared"
+} from "./shared.js"
 
 type RouteContext = {
   params: Promise<{ path: string[] }>
