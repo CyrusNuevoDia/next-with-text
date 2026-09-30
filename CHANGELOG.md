@@ -1,5 +1,11 @@
 # next-with-text
 
+## 0.3.2
+
+### Patch Changes
+
+- 3b66565: Ship compiled declaration files in `dist` and point every `exports` types condition at them, so projects with stricter compiler options such as `noUncheckedIndexedAccess` no longer type-check the library's TypeScript source.
+
 ## 0.3.1
 
 ### Patch Changes
