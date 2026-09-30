@@ -1,10 +1,6 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs"
 import { join, relative, sep } from "node:path"
-import {
-  type ConversionResult,
-  convert,
-  type HtmlMetadata,
-} from "@xberg-io/html-to-markdown"
+import type { ConversionResult, HtmlMetadata } from "@xberg-io/html-to-markdown"
 import multimatch from "multimatch"
 
 const IMAGE_TAG = /<img\b[^>]*>/gi
@@ -386,7 +382,32 @@ export function matchPattern(
 
 export const CONVERT_OPTIONS = { excludeSelectors: ["footer"] }
 
-export function convertHTML(html: string): ConversionResult {
+// The converter is a native addon, loaded on first use rather than at module
+// load: a deployment missing its platform binding still answers every request
+// that needs no conversion (404s, declared md exports) instead of failing them
+// all.
+let converter: Promise<typeof import("@xberg-io/html-to-markdown")> | undefined
+
+export class ConverterUnavailableError extends Error {
+  override name = "ConverterUnavailableError"
+}
+
+async function loadConverter(): Promise<
+  typeof import("@xberg-io/html-to-markdown")
+> {
+  converter ??= import("@xberg-io/html-to-markdown")
+  try {
+    return await converter
+  } catch (error) {
+    throw new ConverterUnavailableError(
+      "the @xberg-io/html-to-markdown native binding failed to load",
+      { cause: error }
+    )
+  }
+}
+
+export async function convertHTML(html: string): Promise<ConversionResult> {
+  const { convert } = await loadConverter()
   const result = convert(stripInlineImages(html), CONVERT_OPTIONS)
   return { ...result, content: selectFrontmatter(result.content ?? "") }
 }

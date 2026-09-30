@@ -1,6 +1,7 @@
 import { existsSync, readdirSync } from "node:fs"
 import { join } from "node:path"
 import {
+  ConverterUnavailableError,
   compareCodeUnits,
   convertHTML,
   discoverBuiltRoutes,
@@ -45,6 +46,23 @@ export function createHandler(options: RouteOptions, loaders: Loaders = {}) {
     req: Request,
     ctx: RouteContext
   ): Promise<Response> {
+    try {
+      return await serve(req, ctx)
+    } catch (error) {
+      // An uncaught throw becomes an empty 500 with nothing to go on; name the
+      // failure in the body and the server log instead.
+      console.error(`[next-with-text] failed to serve ${req.url}`, error)
+      const unavailable = error instanceof ConverterUnavailableError
+      return new Response(
+        unavailable
+          ? "Markdown conversion is unavailable on this deployment"
+          : "Failed to render this llms surface",
+        { status: unavailable ? 503 : 500 }
+      )
+    }
+  }
+
+  async function serve(req: Request, ctx: RouteContext): Promise<Response> {
     const { path } = await ctx.params
     const target = path.join("/")
     const origin = requestOrigin(req)
@@ -78,7 +96,7 @@ export function createHandler(options: RouteOptions, loaders: Loaders = {}) {
         : respond(stubFor(route, override, options.md), "text/markdown")
     }
     return respond(
-      convertHTML(html).content ?? "",
+      (await convertHTML(html)).content ?? "",
       "text/markdown",
       cookie !== null
     )
@@ -202,7 +220,7 @@ async function serveSurface(
           if (html === null) {
             return declared
           }
-          const result = convertHTML(html)
+          const result = await convertHTML(html)
           const rendered = pageMeta(result.metadata)
           return {
             content: publishedBody(override, result.content),
@@ -306,7 +324,7 @@ async function siteMeta(
   const html = await fetchPage(origin, "/", null)
   return html === null
     ? { description: "", title: "" }
-    : pageMeta(convertHTML(html).metadata)
+    : pageMeta((await convertHTML(html)).metadata)
 }
 
 async function fetchPage(

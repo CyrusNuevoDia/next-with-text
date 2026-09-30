@@ -287,7 +287,7 @@ async function buildPage(
   }
   const result = gated
     ? null
-    : convertHTML(readFileSync(htmlPath(serverApp, route), "utf8"))
+    : await convertHTML(readFileSync(htmlPath(serverApp, route), "utf8"))
   const rendered = result
     ? pageMeta(result.metadata)
     : { description: "", title: "" }
