@@ -172,12 +172,13 @@ jobs:
         run: |
           local="sha512-$(openssl dgst -sha512 -binary "$RUNNER_TEMP"/release/npm/*.tgz | base64 -w0)"
           response="$RUNNER_TEMP/npm-registry.json"
-          for _ in {1..12}; do
+          # npm can take a few minutes to serve a fresh publish
+          for _ in {1..60}; do
             code="$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "https://registry.npmjs.org/next-with-text/$VERSION")"
             if [[ "$code" == "200" && "$(jq -r '.dist.integrity' "$response")" == "$local" ]]; then
               exit 0
             fi
-            sleep 5
+            sleep 10
           done
           echo "npm did not expose the expected artifact" >&2
           exit 1
