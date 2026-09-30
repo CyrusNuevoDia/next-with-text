@@ -4,6 +4,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   writeFileSync,
 } from "node:fs"
 import { dirname, join, relative, sep } from "node:path"
@@ -45,6 +46,7 @@ type ConfigFn = (
   ctx: ConfigContext
 ) => NextConfig | Promise<NextConfig>
 
+const CONVERTER = "@xberg-io/html-to-markdown"
 const PHASE_BUILD = "phase-production-build"
 const PHASE_DEV = "phase-development-server"
 const ADAPTER_ENV = "NEXT_WITH_TEXT_UPSTREAM_ADAPTER"
@@ -151,11 +153,14 @@ export function withText(
       // the converter is a native addon — Turbopack can't bundle it into the
       // generated route handler
       serverExternalPackages: [
-        ...new Set([
-          ...(base.serverExternalPackages ?? []),
-          "@xberg-io/html-to-markdown",
-        ]),
+        ...new Set([...(base.serverExternalPackages ?? []), CONVERTER]),
       ],
+    }
+    if (phase === PHASE_BUILD) {
+      config.outputFileTracingIncludes = traceConverter(
+        base.outputFileTracingIncludes,
+        dir
+      )
     }
     if (
       phase === PHASE_BUILD &&
@@ -165,6 +170,55 @@ export function withText(
     }
     return config
   }
+}
+
+const LLMS_ROUTE = "/_llms/**"
+
+// Next's file tracer follows the converter's JS entry but not the
+// platform-specific binding package its loader picks at runtime, so a
+// serverless bundle ships without it and the on-demand route can't convert.
+// Name whichever bindings this build machine installed, at the path Node will
+// look for them from the converter's real location (in an isolated install
+// that path is a symlink, and the glob copies its files there).
+function traceConverter(
+  includes: NextConfig["outputFileTracingIncludes"],
+  dir: string
+): NextConfig["outputFileTracingIncludes"] {
+  const bindings = converterBindings(dir)
+  if (bindings.length === 0) {
+    return includes
+  }
+  return {
+    ...includes,
+    [LLMS_ROUTE]: [...(includes?.[LLMS_ROUTE] ?? []), ...bindings],
+  }
+}
+
+function converterBindings(dir: string): string[] {
+  let converterDir: string
+  try {
+    converterDir = dirname(realpathSync(require.resolve(CONVERTER)))
+  } catch {
+    return []
+  }
+  const manifest = JSON.parse(
+    readFileSync(join(converterDir, "package.json"), "utf8")
+  ) as { optionalDependencies?: Record<string, string> }
+  return Object.keys(manifest.optionalDependencies ?? {}).flatMap((name) => {
+    const found = findPackage(name, converterDir)
+    return found === null
+      ? []
+      : [`${relative(dir, found).split(sep).join("/")}/**`]
+  })
+}
+
+function findPackage(name: string, from: string): string | null {
+  const candidate = join(from, "node_modules", name)
+  if (existsSync(candidate)) {
+    return candidate
+  }
+  const parent = dirname(from)
+  return parent === from ? null : findPackage(name, parent)
 }
 
 function generateRoute(dir: string, options: RouteOptions): void {

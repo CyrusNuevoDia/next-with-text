@@ -19,15 +19,18 @@ import {
 } from "bun:test"
 import { createHash } from "node:crypto"
 import {
+  cpSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs"
-import { join } from "node:path"
+import { tmpdir } from "node:os"
+import { join, relative } from "node:path"
 import { sleep, spawn, spawnSync } from "bun"
 
 setDefaultTimeout(240_000)
@@ -41,6 +44,7 @@ const DEV_PORT = 4311
 const START_PORT = 4312
 const LOCAL_START_PORT = 4313
 const CUSTOM_START_PORT = 4314
+const BUNDLE_PORT = 4315
 const INDEX_LINK = /^- \[.+\]\(\/[^)]+\.md\): .+$/
 
 // the prune ownership probe: a generated file the user edits afterwards must
@@ -137,7 +141,15 @@ type Server = {
   stop: () => Promise<void>
 }
 
-async function startServer(args: string[], port: number): Promise<Server> {
+function startServer(args: string[], port: number): Promise<Server> {
+  return launch([NEXT_BIN, ...args, "-p", String(port)], FIXTURE, port)
+}
+
+async function launch(
+  cmd: string[],
+  cwd: string,
+  port: number
+): Promise<Server> {
   // a stale server on the port makes every assertion meaningless — fail loudly
   const squatter = spawnSync(["lsof", "-ti", `:${port}`])
   if (squatter.stdout.toString().trim() !== "") {
@@ -146,8 +158,9 @@ async function startServer(args: string[], port: number): Promise<Server> {
     )
   }
 
-  const proc = spawn([NEXT_BIN, ...args, "-p", String(port)], {
-    cwd: FIXTURE,
+  const proc = spawn(cmd, {
+    cwd,
+    env: { ...process.env, PORT: String(port) },
     stderr: "pipe",
     stdout: "pipe",
   })
@@ -1065,5 +1078,48 @@ describe("local build — no deploy env", () => {
       accept: "text/markdown",
     })
     expect(await negotiated.text()).toContain("SENTINEL_GETTING_STARTED")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Deploy bundle: a serverless platform runs the on-demand route from the
+// build's file traces, not the project's node_modules. Standalone output is
+// assembled from those same traces, so serving it from outside the repo (where
+// Node can't walk up into the real node_modules) catches anything the trace
+// leaves out — as the converter's platform binding once was, turning every
+// on-demand request into an empty 500.
+// ---------------------------------------------------------------------------
+
+describe("deploy bundle — standalone output", () => {
+  let server: Server
+
+  beforeAll(async () => {
+    await buildFixture({ STANDALONE: "1" })
+    const bundle = mkdtempSync(join(tmpdir(), "next-with-text-bundle-"))
+    cpSync(join(FIXTURE, ".next", "standalone"), bundle, {
+      recursive: true,
+      verbatimSymlinks: true,
+    })
+    const app = join(bundle, relative(ROOT, FIXTURE))
+    cpSync(PUBLIC, join(app, "public"), { recursive: true })
+    server = await launch(["node", "server.js"], app, BUNDLE_PORT)
+  })
+
+  afterAll(async () => {
+    await server.stop()
+  })
+
+  test("excluded and unknown .md routes 404", async () => {
+    const excluded = await get(BUNDLE_PORT, "/docs/internal/secrets.md")
+    expect(excluded.status).toBe(404)
+    expect((await get(BUNDLE_PORT, "/nonexistent.md")).status).toBe(404)
+  })
+
+  test("pages outside the static tier convert on demand", async () => {
+    // /blog/fresh is not in generateStaticParams, so no static twin exists
+    const res = await get(BUNDLE_PORT, "/blog/fresh.md")
+    expect(res.status).toBe(200)
+    expect(await res.text()).toContain("SENTINEL_BLOG_FRESH")
+    expect(server.logs()).not.toContain("native binding")
   })
 })

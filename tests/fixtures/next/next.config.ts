@@ -43,4 +43,8 @@ if (process.env.MD_OFF === "1") {
   options.md = false
 }
 
-export default withText({}, options)
+// Standalone output copies only traced files, like a serverless deploy bundle.
+export default withText(
+  process.env.STANDALONE === "1" ? { output: "standalone" } : {},
+  options
+)
