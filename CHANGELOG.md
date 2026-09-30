@@ -1,5 +1,12 @@
 # next-with-text
 
+## 0.3.3
+
+### Patch Changes
+
+- bbf432d: Stop treating request-conditional proxy matchers as route guards. A matcher with `has` or `missing` conditions (for example a header match on `accept`) runs the proxy only for some requests, so it no longer drops the routes it covers from `llms.txt`, `llms-full.txt`, and the `.md` twins; plain path matchers still exclude their routes.
+- d218272: Fix the on-demand route returning an empty 500 for every request on serverless deployments such as Vercel. The build now adds the converter's platform-specific native binding to the route's file trace, the converter loads only when a page actually needs converting (so excluded and unknown `.md` routes return 404 even without it), and any remaining failure answers with a descriptive 503 or 500 and a server log line instead of an empty 500.
+
 ## 0.3.2
 
 ### Patch Changes
