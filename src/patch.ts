@@ -23,7 +23,7 @@ import {
 } from "./ownership.js"
 import {
   compareCodeUnits,
-  convertHTML,
+  convertHTMLtoMarkdown,
   discoverBuiltHTML,
   discoverModuleRoutes,
   evaluateMd,
@@ -309,7 +309,9 @@ async function buildPage(
     return null
   }
   const result =
-    html === null ? null : await convertHTML(readFileSync(html, "utf8"))
+    html === null
+      ? null
+      : await convertHTMLtoMarkdown(readFileSync(html, "utf8"))
   const rendered = result
     ? pageMeta(result.metadata)
     : { description: "", title: "" }

@@ -3,7 +3,7 @@ import { join } from "node:path"
 import {
   ConverterUnavailableError,
   compareCodeUnits,
-  convertHTML,
+  convertHTMLtoMarkdown,
   discoverBuiltRoutes,
   evaluateMd,
   isPageFile,
@@ -96,7 +96,7 @@ export function createHandler(options: RouteOptions, loaders: Loaders = {}) {
         : respond(stubFor(route, override, options.md), "text/markdown")
     }
     return respond(
-      (await convertHTML(html)).content ?? "",
+      (await convertHTMLtoMarkdown(html)).content ?? "",
       "text/markdown",
       cookie !== null
     )
@@ -220,7 +220,7 @@ async function serveSurface(
           if (html === null) {
             return declared
           }
-          const result = await convertHTML(html)
+          const result = await convertHTMLtoMarkdown(html)
           const rendered = pageMeta(result.metadata)
           return {
             content: publishedBody(override, result.content),
@@ -324,7 +324,7 @@ async function siteMeta(
   const html = await fetchPage(origin, "/", null)
   return html === null
     ? { description: "", title: "" }
-    : pageMeta((await convertHTML(html)).metadata)
+    : pageMeta((await convertHTMLtoMarkdown(html)).metadata)
 }
 
 async function fetchPage(

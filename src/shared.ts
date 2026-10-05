@@ -407,7 +407,17 @@ async function loadConverter(): Promise<
   }
 }
 
-export async function convertHTML(html: string): Promise<ConversionResult> {
+/**
+ * Converts an HTML document to the markdown next-with-text writes for a page's
+ * `.md` twin: inline SVGs, data-URL images and the footer are dropped, and the
+ * frontmatter keeps only `title` and `meta-description`. The first call loads
+ * the converter's native addon, so this runs on Node.js only.
+ *
+ * @throws {ConverterUnavailableError} when the native binding fails to load
+ */
+export async function convertHTMLtoMarkdown(
+  html: string
+): Promise<ConversionResult> {
   const { convert } = await loadConverter()
   const result = convert(stripInlineImages(html), CONVERT_OPTIONS)
   return { ...result, content: selectFrontmatter(result.content ?? "") }
