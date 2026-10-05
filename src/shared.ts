@@ -2,6 +2,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs"
 import { join, relative, sep } from "node:path"
 import type { ConversionResult, HtmlMetadata } from "@xberg-io/html-to-markdown"
 import multimatch from "multimatch"
+import type { NextAdapter } from "next"
 
 const IMAGE_TAG = /<img\b[^>]*>/gi
 const SRC_ATTRIBUTE = /\ssrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i
@@ -475,24 +476,68 @@ export function publishedBody(
   return converted ?? ""
 }
 
+// Route → absolute path of the HTML the build prerendered for it.
+export type PrerenderedHTML = Record<string, string>
+
+type AdapterOutputs = Parameters<
+  NonNullable<NextAdapter["onBuildComplete"]>
+>[0]["outputs"]
+
+// An adapter build's prerendered pages, read off the adapter API's build
+// outputs rather than the dist directory: where the HTML lands is Next's
+// business (16.3.8 moved adapter builds' prerenders from server/app/<route>.html
+// to server/route-cache/… keys), and the outputs name the file either way.
+// Complete app pages only — a dynamic route's fallback shell is not a page,
+// and the pages router has outputs of its own.
+export function adapterPrerenders(
+  outputs: AdapterOutputs,
+  basePath: string
+): PrerenderedHTML {
+  const appPages = new Set(outputs.appPages.map((page) => page.id))
+  const prerenders: PrerenderedHTML = {}
+  for (const output of outputs.prerenders) {
+    const filePath = output.fallback?.filePath
+    if (
+      !(filePath?.endsWith(".html") && appPages.has(output.parentOutputId)) ||
+      (output.routeType ?? "page") !== "page"
+    ) {
+      continue
+    }
+    // the adapter prefixes every pathname with basePath; routes are unprefixed
+    const route =
+      basePath && output.pathname.startsWith(basePath)
+        ? output.pathname.slice(basePath.length) || "/"
+        : output.pathname
+    if (route.includes("[") || route.split("/").some(isPrivateSegment)) {
+      continue
+    }
+    prerenders[route] = filePath
+  }
+  return prerenders
+}
+
+function isPrivateSegment(segment: string): boolean {
+  return segment.startsWith("_") || segment.startsWith("%5F")
+}
+
 // The built HTML in .next/server/app IS the route list: prerendered pages
 // only, so auth-gated dynamic pages are absent by construction (dynamic
 // instances from generateStaticParams included). Returns null when no build
 // output exists — dev, or a serverless function bundle that traced none of it.
-export function discoverBuiltRoutes(dir: string): string[] | null {
+export function discoverBuiltHTML(dir: string): PrerenderedHTML | null {
   const serverApp = join(dir, ".next", "server", "app")
   try {
     if (!existsSync(serverApp)) {
       return null
     }
-    const routes: string[] = []
+    const prerenders: PrerenderedHTML = {}
     walk(serverApp)
-    return routes.sort(compareCodeUnits)
+    return prerenders
 
     function walk(current: string): void {
       for (const entry of readdirSync(current, { withFileTypes: true })) {
         const { name } = entry
-        if (name.startsWith("_") || name.startsWith("%5F")) {
+        if (isPrivateSegment(name)) {
           continue
         }
         if (entry.isDirectory()) {
@@ -502,19 +547,23 @@ export function discoverBuiltRoutes(dir: string): string[] | null {
         if (!name.endsWith(".html")) {
           continue
         }
-        const rel = relative(serverApp, join(current, name)).slice(
-          0,
-          -".html".length
-        )
+        const html = join(current, name)
+        const rel = relative(serverApp, html).slice(0, -".html".length)
         if (rel === "404" || rel === "500") {
           continue
         }
-        routes.push(rel === "index" ? "/" : `/${rel.split(sep).join("/")}`)
+        prerenders[rel === "index" ? "/" : `/${rel.split(sep).join("/")}`] =
+          html
       }
     }
   } catch {
     return null
   }
+}
+
+export function discoverBuiltRoutes(dir: string): string[] | null {
+  const prerenders = discoverBuiltHTML(dir)
+  return prerenders && Object.keys(prerenders).sort(compareCodeUnits)
 }
 
 // Every page compiles to .next/server/app/<route>/page.js whether or not it

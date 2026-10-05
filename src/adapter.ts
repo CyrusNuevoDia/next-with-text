@@ -1,6 +1,9 @@
 import { spawnSync } from "node:child_process"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import type { NextAdapter } from "next"
+import { adapterPrerenders } from "./shared.js"
 
 type NextConfigComplete = Parameters<
   NonNullable<NextAdapter["modifyConfig"]>
@@ -31,15 +34,26 @@ const adapter: NextAdapter = {
   async onBuildComplete(ctx) {
     const payload = process.env.NEXT_WITH_TEXT_BUILD_PAYLOAD
     if (payload) {
-      const patch = spawnSync(
-        process.execPath,
-        [join(moduleDir, "patch.cjs"), payload],
-        {
-          stdio: "inherit",
-        }
+      // The outputs say where each prerendered page's HTML landed; the child
+      // must not guess a dist layout. They go through a file because Linux
+      // caps a single argv entry at 128KB and a large site's list exceeds it.
+      const handoff = mkdtempSync(join(tmpdir(), "next-with-text-"))
+      const prerenders = join(handoff, "prerenders.json")
+      writeFileSync(
+        prerenders,
+        JSON.stringify(adapterPrerenders(ctx.outputs, ctx.config.basePath))
       )
-      if (patch.status === 0) {
-        process.env.NEXT_WITH_TEXT_BUILD_PATCHED = "1"
+      try {
+        const patch = spawnSync(
+          process.execPath,
+          [join(moduleDir, "patch.cjs"), payload, prerenders],
+          { stdio: "inherit" }
+        )
+        if (patch.status === 0) {
+          process.env.NEXT_WITH_TEXT_BUILD_PATCHED = "1"
+        }
+      } finally {
+        rmSync(handoff, { force: true, recursive: true })
       }
     }
     const delegate = await upstream()

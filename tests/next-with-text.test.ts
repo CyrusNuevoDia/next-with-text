@@ -413,6 +413,20 @@ describe("next build", () => {
     ).toEqual({ route: true, static: true })
   })
 
+  test("an adapter build publishes from the adapter's prerender outputs, not a dist layout", () => {
+    // Since 16.3.8 an adapter build writes its prerendered HTML under
+    // .next/server/route-cache, not .next/server/app — walking the latter
+    // found nothing and shipped an empty index. The first assertions pin the
+    // fixture to that layout so the rest of this suite keeps proving the
+    // adapter outputs drive generation.
+    const server = join(FIXTURE, ".next", "server")
+    expect(existsSync(join(server, "app", "index.html"))).toBe(false)
+    expect(existsSync(join(server, "route-cache"))).toBe(true)
+    expect(read("llms.txt")).toStartWith("# Fixture Site\n")
+    expect(read("index.md")).toContain("title: Fixture Site")
+    expect(read("tags/alpha.md")).toContain("MD_TAG_alpha")
+  })
+
   test("typegen keeps its reference to the retained route — tsc stays clean", () => {
     const validator = readFileSync(
       join(FIXTURE, ".next", "types", "validator.ts"),

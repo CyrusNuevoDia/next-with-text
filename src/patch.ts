@@ -1,7 +1,8 @@
-// Child of the withText build-exit hook (spawnSync'd so it may await freely).
-// Walks the built HTML in .next/server/app — the build output IS the route
-// list, so auth-gated dynamic pages are absent by construction — and writes
-// the static surfaces into public/.
+// Child of the withText build-exit hook or adapter (spawnSync'd so it may
+// await freely). The HTML the build prerendered IS the route list — so
+// auth-gated dynamic pages are absent by construction — and the static
+// surfaces are written into public/. An adapter build names that HTML in
+// argv[3] (the adapter API's outputs); a plain build walks .next/server/app.
 
 import {
   existsSync,
@@ -23,7 +24,7 @@ import {
 import {
   compareCodeUnits,
   convertHTML,
-  discoverBuiltRoutes,
+  discoverBuiltHTML,
   discoverModuleRoutes,
   evaluateMd,
   type Link,
@@ -34,6 +35,7 @@ import {
   matchesRoute,
   orderLinks,
   type PageMeta,
+  type PrerenderedHTML,
   pageMeta,
   publishedBody,
   type ResolvedMd,
@@ -62,7 +64,8 @@ type Page = {
   route: string
 }
 
-const payload = JSON.parse(process.argv[2] ?? "{}") as Payload
+const [, , payloadJSON, prerendersFile] = process.argv
+const payload = JSON.parse(payloadJSON ?? "{}") as Payload
 
 main(payload).catch((err) => {
   console.error("[next-with-text] generation failed:", err)
@@ -80,7 +83,10 @@ async function main({
   }
 
   const proxyMatchers = readProxyMatchers(dir)
-  const prerendered = new Set(discoverBuiltRoutes(dir) ?? [])
+  const prerenderedHTML: PrerenderedHTML = prerendersFile
+    ? (JSON.parse(readFileSync(prerendersFile, "utf8")) as PrerenderedHTML)
+    : (discoverBuiltHTML(dir) ?? {})
+  const prerendered = new Set(Object.keys(prerenderedHTML))
   // A route is gated when the build prerendered no HTML for it (it read
   // cookies/headers, or redirected) or a proxy matcher guards it. Gated routes
   // publish nothing at all unless the page opts in with a titled md export —
@@ -114,9 +120,25 @@ async function main({
     return
   }
   const builtPages = await Promise.all(
-    routesToBuild.map((route) => buildPage(serverApp, route, gatedRoute(route)))
+    routesToBuild.map((route) =>
+      buildPage(
+        serverApp,
+        route,
+        gatedRoute(route) ? null : (prerenderedHTML[route] ?? null)
+      )
+    )
   )
   const pages = builtPages.filter((page): page is Page => page !== null)
+  // An empty index deploys as silently as a full one — say so in the log.
+  if (prerendered.size === 0) {
+    console.warn(
+      "[next-with-text] the build prerendered no HTML — llms.txt and llms-full.txt carry only md opt-ins"
+    )
+  } else if (pages.length === 0) {
+    console.warn(
+      "[next-with-text] no page survived include/exclude — llms.txt and llms-full.txt are empty"
+    )
+  }
   const optedIn = pages
     .filter((page) => gatedRoute(page.route))
     .map((page) => page.route)
@@ -276,18 +298,18 @@ function writeOutputs(
   return written
 }
 
+// html is null for a gated route: nothing rendered may be read for it.
 async function buildPage(
   serverApp: string,
   route: string,
-  gated: boolean
+  html: string | null
 ): Promise<Page | null> {
   const override = await pageOverride(serverApp, route)
-  if (gated && !override?.title) {
+  if (html === null && !override?.title) {
     return null
   }
-  const result = gated
-    ? null
-    : await convertHTML(readFileSync(htmlPath(serverApp, route), "utf8"))
+  const result =
+    html === null ? null : await convertHTML(readFileSync(html, "utf8"))
   const rendered = result
     ? pageMeta(result.metadata)
     : { description: "", title: "" }
@@ -341,13 +363,6 @@ function reclaimShadowed(
       )
     }
   }
-}
-
-function htmlPath(serverApp: string, route: string): string {
-  return join(
-    serverApp,
-    route === "/" ? "index.html" : `${route.slice(1)}.html`
-  )
 }
 
 // Deploy detection: VERCEL/CI mark a build whose output ships somewhere;
