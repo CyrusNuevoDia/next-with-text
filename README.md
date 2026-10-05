@@ -172,6 +172,23 @@ llmsfulltxt: ({ title, description, sections }) =>
 
 `content` is exactly what the default `llms-full.txt` would publish for that route: frontmatter is removed, `md` content overrides rendered HTML, gated opt-ins become safe stubs, and excluded or non-publishable routes never reach the callback.
 
+### Converting HTML yourself: `convertHTMLtoMarkdown`
+
+The converter behind the `.md` twins is exported, for HTML that isn't one of your pages:
+
+```ts
+import { convertHTMLtoMarkdown } from "next-with-text";
+
+const { content } = await convertHTMLtoMarkdown(
+  "<html><head><title>Setup</title></head><body><h1>Setup</h1><p>Install it.</p></body></html>"
+);
+// "---\ntitle: Setup\n---\n\n# Setup\n\nInstall it.\n"
+```
+
+`convertHTMLtoMarkdown(html: string): Promise<ConversionResult>` resolves to the converter's result, whose `content` is the same markdown a page's `.md` twin gets: inline SVGs and data-URL images are stripped, the `<footer>` is dropped, and the frontmatter keeps only `title` and `meta-description`. `metadata` carries what the converter read from the document's `<head>`.
+
+It's async because the first call loads a native addon, so it runs on Node.js only — not in the Edge runtime or on Workers. If the addon's platform binding is missing, it rejects with the exported `ConverterUnavailableError`.
+
 ## Generated files clean up after themselves
 
 Building locally leaves your working tree exactly as it was. Nothing to gitignore, nothing to review, no diff noise:

@@ -29,6 +29,7 @@ import {
 
 const moduleDir = dirname(require.resolve("next-with-text"))
 
+export type { ConversionResult } from "@xberg-io/html-to-markdown"
 export type {
   LlmsFulltxtContext,
   LlmstxtContext,
@@ -37,6 +38,8 @@ export type {
   MarkdownProps,
   WithTextOptions,
 } from "./shared.js"
+// biome-ignore lint/performance/noBarrelFile: the package entry is the converter's only public path
+export { ConverterUnavailableError, convertHTMLtoMarkdown } from "./shared.js"
 
 type ConfigContext = {
   defaultConfig?: NextConfig
