@@ -1,101 +1,212 @@
-import { describe, expect, test } from "bun:test"
+import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import {
-  cpSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  symlinkSync,
+  renameSync,
+  rmSync,
   writeFileSync,
 } from "node:fs"
 import { tmpdir } from "node:os"
-import { dirname, join } from "node:path"
+import { join } from "node:path"
 import { spawnSync } from "bun"
 
 const ROOT = join(import.meta.dir, "..")
-const manifest = JSON.parse(
-  readFileSync(join(ROOT, "package.json"), "utf8")
-) as { dependencies: Record<string, string> }
 const SAMPLE_HTML = `<html><head><title>Setup</title><meta name="description" content="How to install"><meta name="viewport" content="width=device-width"></head><body><main><h1>Setup</h1><p>Install it.</p><svg><path d="M0 0"/></svg><img alt="Pixel" src="data:image/png;base64,AAAA"><img alt="Diagram" src="/diagram.png"></main><footer>Copyright</footer></body></html>`
 
+function run(cmd: string[], cwd: string): string {
+  const probe = spawnSync(cmd, {
+    cwd,
+    env: { ...process.env, CI: "", NEXT_WITH_TEXT_STATIC: "0", VERCEL: "" },
+  })
+  if (probe.exitCode !== 0) {
+    throw new Error(
+      `${cmd.join(" ")} failed:\n${probe.stdout}\n${probe.stderr}`
+    )
+  }
+  return probe.stdout.toString()
+}
+
+function installedVersion(name: string): string {
+  const path = require.resolve(`${name}/package.json`, {
+    paths: [ROOT],
+  })
+  return (JSON.parse(readFileSync(path, "utf8")) as { version: string }).version
+}
+
 describe("published package", () => {
-  test("resolves its build helper relative to the installed CJS bundle", () => {
-    const consumer = mkdtempSync(join(tmpdir(), "next-with-text-package-"))
-    const installed = join(consumer, "node_modules", "next-with-text")
-    mkdirSync(installed, { recursive: true })
-    cpSync(join(ROOT, "dist"), join(installed, "dist"), { recursive: true })
-    writeFileSync(
-      join(installed, "package.json"),
-      JSON.stringify({ main: "dist/index.cjs" })
-    )
-    mkdirSync(join(consumer, "app"))
-    // The bundle leaves its dependencies external, so give the consumer the
-    // ones a real install would put beside the package.
-    for (const dependency of Object.keys(manifest.dependencies)) {
-      const link = join(consumer, "node_modules", dependency)
-      mkdirSync(dirname(link), { recursive: true })
-      symlinkSync(join(ROOT, "node_modules", dependency), link)
+  let consumer: string
+
+  beforeAll(() => {
+    consumer = mkdtempSync(join(tmpdir(), "next-with-text-package-"))
+    const tarball =
+      process.env.NEXT_WITH_TEXT_TARBALL ?? join(consumer, "package.tgz")
+    if (!process.env.NEXT_WITH_TEXT_TARBALL) {
+      // The test command already built dist; packing must not rebuild shared files.
+      run(
+        ["bun", "pm", "pack", "--ignore-scripts", "--filename", tarball],
+        ROOT
+      )
     }
-
-    const bundled = readFileSync(join(installed, "dist", "index.cjs"), "utf8")
-    expect(bundled).not.toContain(join(ROOT, "src"))
-
-    // The probe prints once the config resolves: Bun before 1.4 exited 0 from
-    // `-e` when a require failed, so the exit code alone proves nothing.
-    const probe = spawnSync(
-      [
-        "node",
-        "-e",
-        "require('next-with-text').withText()('phase-production-build', {}).then(() => console.log('configured'))",
-      ],
-      { cwd: consumer, env: { ...process.env, CI: "" } }
+    writeFileSync(
+      join(consumer, "package.json"),
+      JSON.stringify({
+        dependencies: {
+          "@types/node": installedVersion("@types/node"),
+          "@types/react": "19.2.18",
+          next: installedVersion("next"),
+          "next-with-text": tarball,
+          react: installedVersion("react"),
+          "react-dom": installedVersion("react-dom"),
+          typescript: installedVersion("typescript"),
+        },
+        private: true,
+      })
     )
-    expect(probe.stderr.toString()).toBe("")
-    expect(probe.stdout.toString()).toBe("configured\n")
-    expect(probe.exitCode).toBe(0)
+    run(["bun", "install", "--ignore-scripts"], consumer)
+    mkdirSync(join(consumer, "app"))
+  }, 120_000)
+
+  afterAll(() => {
+    if (consumer) {
+      rmSync(consumer, { force: true, recursive: true })
+    }
   })
 
-  test("exports the converter from the package entry without loading it eagerly", () => {
-    const consumer = mkdtempSync(join(tmpdir(), "next-with-text-package-"))
-    const scope = join(consumer, "node_modules")
-    mkdirSync(scope, { recursive: true })
-    symlinkSync(ROOT, join(scope, "next-with-text"))
-
-    const probe = spawnSync(
-      [
-        "node",
-        "-e",
-        `const { convertHTMLtoMarkdown, ConverterUnavailableError } = require("next-with-text")
+  for (const format of ["esm", "cjs"] as const) {
+    test(`Node ${format} imports both public entrypoints and converts lazily`, () => {
+      const entry =
+        format === "esm"
+          ? `import entry, { withText, convertHTMLtoMarkdown, ConverterUnavailableError } from "next-with-text"
+import { createHandler } from "next-with-text/route"
+import { createRequire } from "node:module"
+const require = createRequire(import.meta.url)`
+          : `const entry = require("next-with-text")
+const { withText, convertHTMLtoMarkdown, ConverterUnavailableError } = entry
+const { createHandler } = require("next-with-text/route")`
+      const file = join(consumer, format === "esm" ? "probe.mjs" : "probe.cjs")
+      writeFileSync(
+        file,
+        `${entry}
 const loaded = () => Object.keys(require.cache).some((file) => file.includes("html-to-markdown"))
 const eager = loaded()
-convertHTMLtoMarkdown(${JSON.stringify(SAMPLE_HTML)}).then((result) => {
-  console.log(JSON.stringify({
-    content: result.content,
-    eager,
-    error: typeof ConverterUnavailableError,
-    lazy: loaded(),
-  }))
-})`,
-      ],
-      { cwd: consumer }
-    )
-    expect(probe.stderr.toString()).toBe("")
-    const output = JSON.parse(probe.stdout.toString()) as {
-      content: string
-      eager: boolean
-      error: string
-      lazy: boolean
+Promise.all([
+  withText()('phase-production-server', {}),
+  convertHTMLtoMarkdown(${JSON.stringify(SAMPLE_HTML)})
+]).then(([config, result]) => console.log(JSON.stringify({
+  content: result.content,
+  eager,
+  lazy: loaded(),
+  error: typeof ConverterUnavailableError,
+  sameEntry: entry.withText === withText,
+  route: typeof createHandler,
+  external: config.serverExternalPackages.includes("@xberg-io/html-to-markdown")
+})))`
+      )
+      const output = JSON.parse(run(["node", file], consumer)) as {
+        content: string
+        eager: boolean
+        lazy: boolean
+        error: string
+        route: string
+        sameEntry: boolean
+        external: boolean
+      }
+      expect(output.eager).toBe(false)
+      expect(output.lazy).toBe(true)
+      expect(output.error).toBe("function")
+      expect(output.route).toBe("function")
+      expect(output.sameEntry).toBe(true)
+      expect(output.external).toBe(true)
+      expect(output.content).toStartWith(
+        "---\ntitle: Setup\nmeta-description: How to install\n---\n"
+      )
+      expect(output.content).toContain("# Setup")
+      expect(output.content).toContain("![Diagram](/diagram.png)")
+      expect(output.content).not.toContain("data:image")
+      expect(output.content).not.toContain("svg")
+      expect(output.content).not.toContain("Copyright")
+      expect(output.content).not.toContain("viewport")
+    })
+  }
+
+  test("published declarations typecheck in ESM and CommonJS consumers", () => {
+    const source = `import { withText, convertHTMLtoMarkdown, type MarkdownPage } from "next-with-text"
+import { createHandler } from "next-with-text/route"
+const md: MarkdownPage<"/tags/[tag]"> = async ({ params }) => (await params).tag
+withText({}, { llmstxt: ({ title }) => title })
+convertHTMLtoMarkdown("<h1>Setup</h1>").then(({ content }) => content?.toUpperCase())
+createHandler({ include: ["**/*"], exclude: [], md: true, dev: false })
+void md
+`
+    for (const extension of ["mts", "cts"]) {
+      writeFileSync(join(consumer, `consumer.${extension}`), source)
     }
-    expect(output.eager).toBe(false)
-    expect(output.lazy).toBe(true)
-    expect(output.error).toBe("function")
-    expect(output.content).toStartWith(
-      "---\ntitle: Setup\nmeta-description: How to install\n---\n"
+    // Next's own declarations currently fail strict checking (including missing
+    // bundled satori types). Check our published declarations without hiding
+    // their errors behind skipLibCheck or adopting Next's internal diagnostics.
+    const probe = join(consumer, "types.cjs")
+    writeFileSync(
+      probe,
+      `const ts = require("typescript")
+const path = require("node:path")
+const program = ts.createProgram(["consumer.mts", "consumer.cts"], {
+  noEmit: true,
+  strict: true,
+  skipLibCheck: false,
+  module: ts.ModuleKind.NodeNext,
+  moduleResolution: ts.ModuleResolutionKind.NodeNext,
+  target: ts.ScriptTarget.ESNext
+})
+const diagnostics = ts.getPreEmitDiagnostics(program).filter(({ file }) =>
+  !file || file.fileName.includes("/node_modules/next-with-text/") ||
+  path.dirname(file.fileName) === process.cwd()
+)
+if (diagnostics.length) {
+  console.error(ts.formatDiagnosticsWithColorAndContext(diagnostics, {
+    getCanonicalFileName: (file) => file,
+    getCurrentDirectory: () => process.cwd(),
+    getNewLine: () => "\\n"
+  }))
+  process.exitCode = 1
+}`
     )
-    expect(output.content).toContain("# Setup")
-    expect(output.content).toContain("![Diagram](/diagram.png)")
-    expect(output.content).not.toContain("data:image")
-    expect(output.content).not.toContain("svg")
-    expect(output.content).not.toContain("Copyright")
-    expect(output.content).not.toContain("viewport")
+    run(["node", probe], consumer)
+  }, 30_000)
+
+  test("a missing converter doesn't break config or excluded routes", () => {
+    const converter = join(
+      consumer,
+      "node_modules",
+      "@xberg-io",
+      "html-to-markdown"
+    )
+    const unavailable = `${converter}.unavailable`
+    renameSync(converter, unavailable)
+    try {
+      const output = run(
+        [
+          "node",
+          "--input-type=module",
+          "-e",
+          `import { withText, convertHTMLtoMarkdown, ConverterUnavailableError } from "next-with-text"
+import { createHandler } from "next-with-text/route"
+await withText()('phase-production-server', {})
+const handle = createHandler({ include: ["**/*"], exclude: ["**/*"], md: true, dev: false })
+const response = await handle(new Request("http://localhost/excluded.md"), { params: Promise.resolve({ path: ["excluded.md"] }) })
+try {
+  await convertHTMLtoMarkdown("<h1>Setup</h1>")
+  throw new Error("conversion unexpectedly succeeded")
+} catch (error) {
+  if (!(error instanceof ConverterUnavailableError)) throw error
+}
+console.log(response.status)`,
+        ],
+        consumer
+      )
+      expect(output).toBe("404\n")
+    } finally {
+      renameSync(unavailable, converter)
+    }
   })
 })
