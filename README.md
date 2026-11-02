@@ -29,13 +29,13 @@ No route handlers to write, no middleware, no config files, no route lists to ma
 
 Building locally leaves nothing behind: the generated files exist only for the deploy build that needs them ([details](#generated-files-clean-up-after-themselves)).
 
-Requires Next.js 16+ and the App Router.
+Requires Next.js 16.x and the App Router. Both ESM imports and CommonJS `require()` are supported.
 
 ## How it works
 
 `withText` hooks into the Next.js build and generates a private catch-all route. From there, the package has two paths that produce the same markdown:
 
-1. **At build time**, it reads the HTML Next prerendered (named by the deployment adapter's build outputs on platforms like Vercel, found in `.next/server/app` otherwise), discovers the concrete routes Next actually emitted, converts each page to markdown, and writes `llms.txt`, `llms-full.txt`, and the per-page `.md` files into the deploy artifact. Metadata and `export const md` overrides are applied before the files are grouped and rendered.
+1. **At build time**, its adapter reads the prerendered HTML paths supplied by Next.js, discovers the concrete routes Next emitted, converts each page to markdown, and writes `llms.txt`, `llms-full.txt`, and the per-page `.md` files into the deploy artifact. It composes with your deployment adapter and supports a custom `distDir`, without depending on a particular Next.js output layout. Metadata and `export const md` overrides are applied before the files are grouped and rendered. If generation fails, the build fails before your deployment adapter collects its output.
 2. **At request time**, the generated route serves the same surfaces when a static file is unavailable, including during development. For a dynamic `.md` request it evaluates the page's `md` export when present; otherwise it fetches the page from the same deployment, forwards the visitor's cookies, and converts the returned HTML to markdown.
 
 This split is also the auth boundary. The static path only sees pages Next prerendered, then removes routes covered by compiled proxy matchers, so private rendered HTML never enters a deploy artifact. A dynamic request renders with the caller's own session and returns `Cache-Control: private, no-store`; a gated page reaches the public indexes only when its source explicitly exports publishable `md` metadata or content.
@@ -127,6 +127,8 @@ export const md: MarkdownPage<"/tags/[tag]"> = async ({ params }) =>
 
 Functions also receive `searchParams`, just like standard `PageProps`.
 
+The Next.js editor plugin may still flag `md` as an unsupported page export. `next-with-text` permits it during production builds while retaining Next.js's other page checks.
+
 ### Custom index: the `llmstxt` function
 
 If the default template isn't right, take over the whole file:
@@ -202,7 +204,7 @@ A deploy build is one where `CI` or `VERCEL` is set — true on Vercel, GitHub A
 NEXT_WITH_TEXT_STATIC=1 next build
 ```
 
-The same variable set to `0` forces local behavior anywhere, including CI. With `output: "standalone"` the files are also written into `.next/standalone/public` on every build — that tree is the deployable artifact, never your working copy — so a standalone build shouldn't need the override. That path hasn't been verified on a real standalone deploy yet; set `NEXT_WITH_TEXT_STATIC=1` if you'd rather not rely on it.
+The same variable set to `0` forces local behavior anywhere, including CI. With `output: "standalone"`, the generated files are staged during the build, then copied into the standalone app's `public/` directory after Next.js creates it (`.next/standalone/public` by default). This runs even with `NEXT_WITH_TEXT_STATIC=0`, so local standalone builds include static markdown without writing generated files into your project's `public/` directory.
 
 Local `next start` serves every surface identically — the on-demand route covers what the static files would have. It's a request-time HTML conversion rather than a file read, so it's slower than production, and it's the only difference you'll see.
 
@@ -230,10 +232,20 @@ Every surface is asserted by a test suite that builds a real Next app — file-l
 
 ```bash
 bun install
+bun install --frozen-lockfile --cwd tests/fixtures/next
 bun run test   # builds the library, then runs the verifier suite against tests/fixtures/next
 ```
 
 The test suite builds a fixture Next app, inspects the build output, and asserts over HTTP against `next start` and `next dev` — including auth exclusion, cookie-forwarded on-demand conversion, and Accept negotiation.
+
+CI also installs the packed package into fresh consumers and checks both webpack and Turbopack at fixed Next.js 16 compatibility checkpoints, including the 16.3.8 output layout change, and the latest stable 16.x release. Each run prints the exact version tested. To run one compatibility case after building the package:
+
+```bash
+bun run build
+NEXT_COMPAT_VERSION=16.0.0 NEXT_COMPAT_BUNDLER=webpack bun test tests/compatibility.test.ts
+```
+
+Set `NEXT_WITH_TEXT_TARBALL` to an absolute tarball path to verify an existing package artifact. The compatibility runner and package tests use that artifact without rebuilding it.
 
 ## License
 

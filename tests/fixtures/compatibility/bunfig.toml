@@ -1,0 +1,15 @@
+[install]
+# The matrix intentionally tests an exact selected Next release, including one
+# younger than the developer's global age limit. Other packages keep that limit.
+minimumReleaseAgeExcludes = [
+  "next",
+  "@next/env",
+  "@next/swc-darwin-arm64",
+  "@next/swc-darwin-x64",
+  "@next/swc-linux-arm64-gnu",
+  "@next/swc-linux-arm64-musl",
+  "@next/swc-linux-x64-gnu",
+  "@next/swc-linux-x64-musl",
+  "@next/swc-win32-arm64-msvc",
+  "@next/swc-win32-x64-msvc",
+]

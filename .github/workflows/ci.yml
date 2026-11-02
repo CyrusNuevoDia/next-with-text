@@ -26,5 +26,52 @@ jobs:
           node-version: "24"
       - name: deps
         run: bun install --frozen-lockfile
+      - name: fixture-deps
+        run: bun install --frozen-lockfile --cwd tests/fixtures/next
+      - name: types
+        run: bunx --no-install tsc --noEmit
+      - name: check
+        run: bun run check
       - name: test
         run: bun run test
+
+  compatibility:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        next: ["16.0.0", "16.1.0", "16.2.0", "16.3.7", "16.3.8", "16.x"]
+        bundler: [webpack, turbopack]
+    steps:
+      - uses: actions/checkout@v6
+        name: checkout
+      - uses: oven-sh/setup-bun@v2
+        name: setup[bun]
+        with:
+          bun-version-file: package.json
+      - uses: actions/setup-node@v6
+        name: setup[node]
+        with:
+          node-version: "24"
+      - name: deps
+        run: bun install --frozen-lockfile
+      - id: next-version
+        name: resolve-next
+        env:
+          NEXT_VERSION: ${{ matrix.next }}
+        run: |
+          if [[ "$NEXT_VERSION" == "16.x" ]]; then
+            NEXT_VERSION="$(npm view 'next@16' version --json | jq -er 'if type == "array" then max_by(split(".") | map(tonumber)) else . end | select(test("^16\\.[0-9]+\\.[0-9]+$"))')"
+          fi
+          echo "Next.js $NEXT_VERSION"
+          echo "version=$NEXT_VERSION" >> "$GITHUB_OUTPUT"
+      - name: build-and-pack
+        run: |
+          bun run build
+          bun pm pack --ignore-scripts --filename "$RUNNER_TEMP/next-with-text.tgz"
+      - name: test
+        env:
+          NEXT_COMPAT_VERSION: ${{ steps.next-version.outputs.version }}
+          NEXT_COMPAT_BUNDLER: ${{ matrix.bundler }}
+          NEXT_WITH_TEXT_TARBALL: ${{ runner.temp }}/next-with-text.tgz
+        run: bun test tests/compatibility.test.ts

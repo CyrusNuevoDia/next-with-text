@@ -39,6 +39,8 @@ jobs:
           node-version: "24"
       - name: deps
         run: bun install --frozen-lockfile
+      - name: fixture-deps
+        run: bun install --frozen-lockfile --cwd tests/fixtures/next
       - name: test
         run: bun run test
       - id: release
@@ -106,6 +108,10 @@ jobs:
         name: setup[bun]
         with:
           bun-version-file: package.json
+      - uses: actions/setup-node@v6
+        name: setup[node]
+        with:
+          node-version: "24"
       - name: deps
         run: bun install --frozen-lockfile
       - id: package
@@ -113,8 +119,13 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/release"
           bun run build
-          npm pack --pack-destination "$RUNNER_TEMP/release"
+          npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/release"
           echo "version=$(jq -r '.version' package.json)" >> "$GITHUB_OUTPUT"
+      - name: verify-package
+        run: |
+          packages=("$RUNNER_TEMP"/release/*.tgz)
+          [[ ${#packages[@]} -eq 1 && -f "${packages[0]}" ]]
+          NEXT_WITH_TEXT_TARBALL="${packages[0]}" bun test tests/package.test.ts
       - uses: actions/upload-artifact@v7
         name: upload[npm]
         with:
