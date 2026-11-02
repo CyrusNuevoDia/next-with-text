@@ -6,13 +6,13 @@ import { adapterPrerenders } from "../src/shared.js"
 type Outputs = Parameters<typeof adapterPrerenders>[0]
 
 function outputs(
-  prerenders: Record<string, unknown>[],
+  prerenders: Outputs["prerenders"],
   appPageIds: string[]
 ): Outputs {
   return {
     appPages: appPageIds.map((id) => ({ id })),
     prerenders,
-  } as unknown as Outputs
+  }
 }
 
 const html = (route: string) =>
@@ -62,6 +62,15 @@ describe("adapterPrerenders", () => {
             routeType: "fallback",
           },
           {
+            fallback: {
+              filePath: html("/partial"),
+              postponedState: { type: "DYNAMIC_DATA" },
+            },
+            parentOutputId: "/partial",
+            pathname: "/partial",
+            routeType: "page",
+          },
+          {
             fallback: { filePath: html("/_not-found") },
             parentOutputId: "/_not-found",
             pathname: "/_not-found",
@@ -80,7 +89,7 @@ describe("adapterPrerenders", () => {
             routeType: "page",
           },
         ],
-        ["/blog/[slug]", "/_not-found", "/about"]
+        ["/blog/[slug]", "/partial", "/_not-found", "/about"]
       ),
       ""
     )

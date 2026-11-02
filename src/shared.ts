@@ -1,8 +1,7 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs"
-import { join, relative, sep } from "node:path"
+import { readFileSync } from "node:fs"
+import { join, resolve } from "node:path"
 import type { ConversionResult, HtmlMetadata } from "@xberg-io/html-to-markdown"
 import multimatch from "multimatch"
-import type { NextAdapter } from "next"
 
 const IMAGE_TAG = /<img\b[^>]*>/gi
 const SRC_ATTRIBUTE = /\ssrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i
@@ -91,7 +90,7 @@ export type WithTextOptions = {
 }
 
 // The serializable subset — it crosses into the codegen'd route and the
-// build-exit child as JSON. The llmstxt function travels separately.
+// adapter-owned child as JSON. The llmstxt function travels separately.
 export type ResolvedOptions = {
   exclude: string[]
   include: string[]
@@ -103,7 +102,7 @@ export type ResolvedOptions = {
 // Turbopack inlines whatever NODE_ENV happened to be at bundle time (under
 // `bun test` that's "test"), while the config phase is what Next itself
 // reported, and the file is regenerated on every config load.
-export type RouteOptions = ResolvedOptions & { dev: boolean }
+export type RouteOptions = ResolvedOptions & { dev: boolean; distDir?: string }
 
 export function resolveOptions(options: WithTextOptions = {}): ResolvedOptions {
   return {
@@ -489,9 +488,15 @@ export function publishedBody(
 // Route → absolute path of the HTML the build prerendered for it.
 export type PrerenderedHTML = Record<string, string>
 
-type AdapterOutputs = Parameters<
-  NonNullable<NextAdapter["onBuildComplete"]>
->[0]["outputs"]
+type AdapterOutputs = {
+  appPages: Array<{ id: string }>
+  prerenders: Array<{
+    pathname: string
+    parentOutputId: string
+    routeType?: string
+    fallback?: { filePath?: string; postponedState?: unknown }
+  }>
+}
 
 // An adapter build's prerendered pages, read off the adapter API's build
 // outputs rather than the dist directory: where the HTML lands is Next's
@@ -509,7 +514,9 @@ export function adapterPrerenders(
     const filePath = output.fallback?.filePath
     if (
       !(filePath?.endsWith(".html") && appPages.has(output.parentOutputId)) ||
-      (output.routeType ?? "page") !== "page"
+      (output.routeType ?? "page") !== "page" ||
+      (output.fallback?.postponedState !== undefined &&
+        output.fallback.postponedState !== null)
     ) {
       continue
     }
@@ -530,127 +537,30 @@ function isPrivateSegment(segment: string): boolean {
   return segment.startsWith("_") || segment.startsWith("%5F")
 }
 
-// The built HTML in .next/server/app IS the route list: prerendered pages
-// only, so auth-gated dynamic pages are absent by construction (dynamic
-// instances from generateStaticParams included). Returns null when no build
-// output exists — dev, or a serverless function bundle that traced none of it.
-export function discoverBuiltHTML(dir: string): PrerenderedHTML | null {
-  const serverApp = join(dir, ".next", "server", "app")
+// Local next start uses the same safe route list the adapter saw. Deployment
+// bundles normally serve the generated public files and need no build cache.
+export function discoverBuiltRoutes(dir: string, distDir = ".next"): string[] {
+  const path = join(
+    resolve(dir, distDir),
+    "cache",
+    "next-with-text-routes.json"
+  )
   try {
-    if (!existsSync(serverApp)) {
-      return null
+    const routes: unknown = JSON.parse(readFileSync(path, "utf8"))
+    if (
+      !Array.isArray(routes) ||
+      routes.some((route) => typeof route !== "string")
+    ) {
+      throw new Error("invalid cached route list")
     }
-    const prerenders: PrerenderedHTML = {}
-    walk(serverApp)
-    return prerenders
-
-    function walk(current: string): void {
-      for (const entry of readdirSync(current, { withFileTypes: true })) {
-        const { name } = entry
-        if (isPrivateSegment(name)) {
-          continue
-        }
-        if (entry.isDirectory()) {
-          walk(join(current, name))
-          continue
-        }
-        if (!name.endsWith(".html")) {
-          continue
-        }
-        const html = join(current, name)
-        const rel = relative(serverApp, html).slice(0, -".html".length)
-        if (rel === "404" || rel === "500") {
-          continue
-        }
-        prerenders[rel === "index" ? "/" : `/${rel.split(sep).join("/")}`] =
-          html
-      }
-    }
-  } catch {
-    return null
-  }
-}
-
-export function discoverBuiltRoutes(dir: string): string[] | null {
-  const prerenders = discoverBuiltHTML(dir)
-  return prerenders && Object.keys(prerenders).sort(compareCodeUnits)
-}
-
-// Every page compiles to .next/server/app/<route>/page.js whether or not it
-// prerendered to HTML, so this is the one place a build can see the routes
-// discoverBuiltRoutes can't — the auth-gated and otherwise dynamic ones. Only
-// literal paths: /users/[id] has no concrete URL to publish, so a dynamic
-// segment ends that branch.
-export function discoverModuleRoutes(dir: string): string[] {
-  const serverApp = join(dir, ".next", "server", "app")
-  try {
-    if (!existsSync(serverApp)) {
+    return routes
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return []
     }
-    const routes: string[] = []
-    walk(serverApp, "")
-    return routes.sort(compareCodeUnits)
-
-    function walk(current: string, route: string): void {
-      for (const entry of readdirSync(current, { withFileTypes: true })) {
-        const { name } = entry
-        if (!entry.isDirectory()) {
-          if (name === "page.js") {
-            routes.push(route === "" ? "/" : route)
-          }
-          continue
-        }
-        // "page"/"route" hold a compiled page's manifests, and *.segments its
-        // RSC payloads — neither is a route segment. Dots are matched only at
-        // that suffix: /docs/v1.2 is a perfectly legal route directory.
-        if (
-          name.startsWith("_") ||
-          name.startsWith("%5F") ||
-          name.startsWith("@") ||
-          name.startsWith("[") ||
-          name === "page" ||
-          name === "route" ||
-          name.endsWith(".segments")
-        ) {
-          continue
-        }
-        walk(join(current, name), `${route}/${name}`)
-      }
-    }
-  } catch {
-    return []
-  }
-}
-
-// Next 16 exposes proxy.ts matchers (compiled regexp + originalSource) in the
-// build's functions-config-manifest.json — middleware-manifest.json stays
-// empty, and dev writes no such manifest (so dev applies no proxy exclusion,
-// same as it always has). The path is a literal-suffixed join so Turbopack can
-// scope its tracing to .next instead of the whole project.
-type ProxyMatcher = {
-  has?: unknown[]
-  missing?: unknown[]
-  regexp: string
-}
-
-export function readProxyMatchers(dir: string): RegExp[] {
-  const manifestPath = join(dir, ".next/server/functions-config-manifest.json")
-  try {
-    if (!existsSync(manifestPath)) {
-      return []
-    }
-    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
-      functions?: Record<string, { matchers?: ProxyMatcher[] }>
-    }
-    // A matcher with has/missing conditions runs the proxy only for some
-    // requests (a header, cookie, or query), so it guards no route outright —
-    // `has: accept` alone would otherwise exclude every page.
-    return Object.values(manifest.functions ?? {})
-      .flatMap((fn) => fn.matchers ?? [])
-      .filter((matcher) => !(matcher.has?.length || matcher.missing?.length))
-      .map((matcher) => new RegExp(matcher.regexp))
-  } catch {
-    // a corrupt manifest just skips exclusion for this build
-    return []
+    throw new Error(
+      "[next-with-text] could not read the generated route list",
+      { cause: error }
+    )
   }
 }

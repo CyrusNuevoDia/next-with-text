@@ -16,7 +16,6 @@ import {
   publishedBody,
   type ResolvedMd,
   type RouteOptions,
-  readProxyMatchers,
   renderFull,
   renderIndex,
   renderStub,
@@ -185,8 +184,8 @@ async function serveSurface(
   options: RouteOptions,
   loaders: Loaders
 ): Promise<Response> {
-  const discovered = discoverRoutes(options.dev).filter((route) =>
-    matchesRoute(route, options)
+  const discovered = discoverRoutes(options.dev, options.distDir).filter(
+    (route) => matchesRoute(route, options)
   )
   // Gated routes are missing from that list by construction — nothing
   // prerendered, or a proxy matcher covers them. A literal-path page exporting
@@ -262,11 +261,9 @@ async function serveSurface(
 // auth-gated dynamic pages stay out of the index by construction. A serverless
 // bundle has neither (deploy builds ship static public files instead) and
 // degrades to an empty list.
-function discoverRoutes(dev: boolean): string[] {
+function discoverRoutes(dev: boolean, distDir?: string): string[] {
   const dir = process.cwd()
-  const routes = dev ? walkAppRoutes(dir) : (discoverBuiltRoutes(dir) ?? [])
-  const proxyMatchers = readProxyMatchers(dir)
-  return routes.filter((route) => !proxyMatchers.some((re) => re.test(route)))
+  return dev ? walkAppRoutes(dir) : discoverBuiltRoutes(dir, distDir)
 }
 
 function walkAppRoutes(dir: string): string[] {

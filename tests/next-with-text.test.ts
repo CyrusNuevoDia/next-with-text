@@ -31,7 +31,7 @@ import {
 } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, relative } from "node:path"
-import { sleep, spawn, spawnSync } from "bun"
+import { deepEquals, sleep, spawn, spawnSync } from "bun"
 
 setDefaultTimeout(240_000)
 
@@ -141,14 +141,19 @@ type Server = {
   stop: () => Promise<void>
 }
 
-function startServer(args: string[], port: number): Promise<Server> {
-  return launch([NEXT_BIN, ...args, "-p", String(port)], FIXTURE, port)
+function startServer(
+  args: string[],
+  port: number,
+  env: Record<string, string> = {}
+): Promise<Server> {
+  return launch([NEXT_BIN, ...args, "-p", String(port)], FIXTURE, port, env)
 }
 
 async function launch(
   cmd: string[],
   cwd: string,
-  port: number
+  port: number,
+  env: Record<string, string> = {}
 ): Promise<Server> {
   // a stale server on the port makes every assertion meaningless — fail loudly
   const squatter = spawnSync(["lsof", "-ti", `:${port}`])
@@ -160,7 +165,7 @@ async function launch(
 
   const proc = spawn(cmd, {
     cwd,
-    env: { ...process.env, PORT: String(port) },
+    env: { ...process.env, PORT: String(port), ...env },
     stderr: "pipe",
     stdout: "pipe",
   })
@@ -413,15 +418,7 @@ describe("next build", () => {
     ).toEqual({ route: true, static: true })
   })
 
-  test("an adapter build publishes from the adapter's prerender outputs, not a dist layout", () => {
-    // Since 16.3.8 an adapter build writes its prerendered HTML under
-    // .next/server/route-cache, not .next/server/app — walking the latter
-    // found nothing and shipped an empty index. The first assertions pin the
-    // fixture to that layout so the rest of this suite keeps proving the
-    // adapter outputs drive generation.
-    const server = join(FIXTURE, ".next", "server")
-    expect(existsSync(join(server, "app", "index.html"))).toBe(false)
-    expect(existsSync(join(server, "route-cache"))).toBe(true)
+  test("an adapter build publishes prerendered page content", () => {
     expect(read("llms.txt")).toStartWith("# Fixture Site\n")
     expect(read("index.md")).toContain("title: Fixture Site")
     expect(read("tags/alpha.md")).toContain("MD_TAG_alpha")
@@ -1126,13 +1123,25 @@ describe("deploy bundle — standalone output", () => {
   let server: Server
 
   beforeAll(async () => {
-    await buildFixture({ STANDALONE: "1" })
+    await buildFixture({ CI: "", STANDALONE: "1", VERCEL: "" })
     const bundle = mkdtempSync(join(tmpdir(), "next-with-text-bundle-"))
     cpSync(join(FIXTURE, ".next", "standalone"), bundle, {
       recursive: true,
       verbatimSymlinks: true,
     })
     const app = join(bundle, relative(ROOT, FIXTURE))
+    // Next recreates standalone after its adapter callback. These must have
+    // survived finalization before the fixture's user-owned public files merge.
+    const bundledPublic = join(app, "public")
+    expect(readFileSync(join(bundledPublic, "index.md"), "utf8")).toContain(
+      "SENTINEL_HOME"
+    )
+    expect(readFileSync(join(bundledPublic, "llms.txt"), "utf8")).toContain(
+      "](/about.md)"
+    )
+    expect(
+      readFileSync(join(bundledPublic, "llms-full.txt"), "utf8")
+    ).toContain("MD_OVERRIDE_ABOUT")
     cpSync(PUBLIC, join(app, "public"), { recursive: true })
     server = await launch(["node", "server.js"], app, BUNDLE_PORT)
   })
@@ -1153,5 +1162,87 @@ describe("deploy bundle — standalone output", () => {
     expect(res.status).toBe(200)
     expect(await res.text()).toContain("SENTINEL_BLOG_FRESH")
     expect(server.logs()).not.toContain("native binding")
+  })
+})
+
+describe("upstream adapter changes distDir", () => {
+  const distDir = ".adapter-next"
+  const tsconfigPath = join(FIXTURE, "tsconfig.json")
+  const port = 4316
+  let server: Server | undefined
+  let originalTSConfig: string
+
+  beforeAll(async () => {
+    originalTSConfig = readFileSync(tsconfigPath, "utf8")
+    cleanFixture()
+    rmSync(join(FIXTURE, distDir), { force: true, recursive: true })
+    await buildFixture({
+      ADAPTER_DIST_DIR: distDir,
+      CI: "",
+      VERCEL: "",
+    })
+    server = await startServer(["start"], port, {
+      ADAPTER_DIST_DIR: distDir,
+    })
+  })
+
+  afterAll(async () => {
+    await server?.stop()
+    // Next appends the configured dist directory's generated types. Reclaim
+    // exactly that delta, preserving any other edit made while the test ran.
+    const original = JSON.parse(originalTSConfig)
+    const generatedIncludes = [
+      `${distDir}/types/**/*.ts`,
+      `${distDir}/dev/types/**/*.ts`,
+    ]
+    if (Array.isArray(original.include)) {
+      const expected = {
+        ...original,
+        include: [
+          ...original.include,
+          ...generatedIncludes.filter(
+            (path) => !original.include.includes(path)
+          ),
+        ],
+      }
+      if (
+        deepEquals(JSON.parse(readFileSync(tsconfigPath, "utf8")), expected)
+      ) {
+        writeFileSync(tsconfigPath, originalTSConfig)
+      }
+    }
+    rmSync(join(FIXTURE, distDir), { force: true, recursive: true })
+    cleanFixture()
+  })
+
+  test("local indexes and markdown use the adapter's final build directory", async () => {
+    expect(existsSync(join(FIXTURE, distDir, "BUILD_ID"))).toBe(true)
+    const index = await (await get(port, "/llms.txt")).text()
+    expect(index).toContain("](/blog/hello.md)")
+    expect(index).toContain("](/tags/alpha.md)")
+    expect(index).not.toContain("/account.md")
+    const full = await (await get(port, "/llms-full.txt")).text()
+    expect(full).toContain("SENTINEL_HOME")
+    expect(full).toContain("MD_OVERRIDE_ABOUT")
+    expect(await (await get(port, "/zebra.md")).text()).toContain(
+      "SENTINEL_ZEBRA"
+    )
+  })
+})
+
+describe("failed build — template callback", () => {
+  test("a throwing template fails the build before upstream deployment collection", async () => {
+    cleanFixture()
+    try {
+      await expect(
+        buildFixture({
+          LLMSTXT_FN: "error",
+          NEXT_ADAPTER_PATH: join(FIXTURE, "adapter-probe.cjs"),
+        })
+      ).rejects.toThrow("TEMPLATE_CALLBACK_FAILURE")
+      expect(existsSync(join(FIXTURE, "adapter-probe.json"))).toBe(false)
+    } finally {
+      cleanFixture()
+    }
   })
 })

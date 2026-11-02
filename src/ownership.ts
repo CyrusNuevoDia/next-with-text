@@ -53,8 +53,11 @@ export function userPublicFile(
   )
 }
 
-export function generatedManifest(dir: string): Record<string, string> {
-  const path = join(dir, ".next", "cache", MANIFEST)
+export function generatedManifest(
+  dir: string,
+  distDir = join(dir, ".next")
+): Record<string, string> {
+  const path = join(distDir, "cache", MANIFEST)
   if (!existsSync(path)) {
     return {}
   }

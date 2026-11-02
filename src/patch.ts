@@ -1,13 +1,9 @@
-// Child of the withText build-exit hook or adapter (spawnSync'd so it may
-// await freely). The HTML the build prerendered IS the route list — so
-// auth-gated dynamic pages are absent by construction — and the static
-// surfaces are written into public/. An adapter build names that HTML in
-// argv[3] (the adapter API's outputs); a plain build walks .next/server/app.
+// Generation runs only from Next’s adapter completion hook. Its normalized
+// context names each artifact; no build directory discovery is needed here.
 
 import {
   existsSync,
   mkdirSync,
-  readdirSync,
   readFileSync,
   rmdirSync,
   rmSync,
@@ -15,6 +11,11 @@ import {
 } from "node:fs"
 import { createRequire } from "node:module"
 import { dirname, join } from "node:path"
+import type {
+  BuildContext,
+  BuildPayload,
+  CompiledPage,
+} from "./build-context.js"
 import {
   generatedManifest,
   hashOf,
@@ -24,8 +25,6 @@ import {
 import {
   compareCodeUnits,
   convertHTMLtoMarkdown,
-  discoverBuiltHTML,
-  discoverModuleRoutes,
   evaluateMd,
   type Link,
   type LlmsFulltxtContext,
@@ -33,14 +32,13 @@ import {
   llmsfulltxtSections,
   llmstxtSections,
   matchesRoute,
+  matchPattern,
   orderLinks,
   type PageMeta,
-  type PrerenderedHTML,
   pageMeta,
   publishedBody,
   type ResolvedMd,
   type ResolvedOptions,
-  readProxyMatchers,
   renderFull,
   renderIndex,
   renderStub,
@@ -49,12 +47,6 @@ import {
 
 const MANIFEST = "next-with-text-manifest.json"
 
-type Payload = {
-  dir: string
-  hasLlmsfulltxt: boolean
-  hasLlmstxt: boolean
-  options: ResolvedOptions
-}
 type Page = {
   // null when the page publishes no body: nothing to write as a .md twin, and
   // a stub rather than an inlined section in llms-full.txt
@@ -64,41 +56,51 @@ type Page = {
   route: string
 }
 
-const [, , payloadJSON, prerendersFile] = process.argv
-const payload = JSON.parse(payloadJSON ?? "{}") as Payload
+const [, , payloadJSON, contextFile] = process.argv
+Promise.resolve()
+  .then(() => {
+    if (!(payloadJSON && contextFile)) {
+      throw new Error(
+        "[next-with-text] generation requires adapter build context"
+      )
+    }
+    return main(
+      JSON.parse(payloadJSON) as BuildPayload,
+      JSON.parse(readFileSync(contextFile, "utf8")) as BuildContext
+    )
+  })
+  .catch((err) => {
+    console.error("[next-with-text] generation failed:", err)
+    process.exitCode = 1
+  })
 
-main(payload).catch((err) => {
-  console.error("[next-with-text] generation failed:", err)
-})
-
-async function main({
-  dir,
-  options,
-  hasLlmsfulltxt,
-  hasLlmstxt,
-}: Payload): Promise<void> {
-  const serverApp = join(dir, ".next", "server", "app")
-  if (!(existsSync(join(dir, ".next", "BUILD_ID")) && existsSync(serverApp))) {
-    return
-  }
-
-  const proxyMatchers = readProxyMatchers(dir)
-  const prerenderedHTML: PrerenderedHTML = prerendersFile
-    ? (JSON.parse(readFileSync(prerendersFile, "utf8")) as PrerenderedHTML)
-    : (discoverBuiltHTML(dir) ?? {})
+async function main(
+  { options, hasLlmsfulltxt, hasLlmstxt }: BuildPayload,
+  context: BuildContext
+): Promise<void> {
+  const { projectDir: dir, distDir, prerenderedHTML } = context
+  const proxyMatchers = context.proxyMatchers.map(
+    (source) => new RegExp(source)
+  )
   const prerendered = new Set(Object.keys(prerenderedHTML))
   // A route is gated when the build prerendered no HTML for it (it read
   // cookies/headers, or redirected) or a proxy matcher guards it. Gated routes
   // publish nothing at all unless the page opts in with a titled md export —
   // and even then only what that export declares, never rendered output.
   const gatedRoute = (route: string) =>
-    !prerendered.has(route) || proxyMatchers.some((re) => re.test(route))
-  const routes = [...new Set([...prerendered, ...discoverModuleRoutes(dir)])]
+    !prerendered.has(route) ||
+    proxyMatchers.some((re) =>
+      re.test(`${context.basePath}${route === "/" ? "" : route}` || "/")
+    )
+  const literalPages = context.pages
+    .map((page) => page.pattern)
+    .filter((route) => !route.includes("["))
+  const routes = [...new Set([...prerendered, ...literalPages])]
     .filter((route) => matchesRoute(route, options))
     .sort(compareCodeUnits)
 
   const appRoutes = userAppRoutes(dir)
-  const manifest = generatedManifest(dir)
+  const manifest = generatedManifest(dir, distDir)
   const ownedByUser = (rel: string) =>
     appRoutes.has(rel) || userPublicFile(dir, rel, manifest)
   const needsIndex = !ownedByUser("llms.txt")
@@ -113,16 +115,27 @@ async function main({
       : []
   }
 
+  // Next recreates standalone after this hook. Stage its public tier outside
+  // that tree; the adapter copies it after Next finishes, without regenerating.
+  const standalonePublic = context.standaloneDir
+    ? join(distDir, "cache", "next-with-text-standalone")
+    : undefined
+  if (standalonePublic) {
+    rmSync(standalonePublic, { force: true, recursive: true })
+    mkdirSync(standalonePublic, { recursive: true })
+  }
+
   const publicDir = join(dir, "public")
   if (!(needsIndex || needsFull) && routesToBuild.length === 0) {
-    prune(dir, publicDir, {})
+    cacheRoutes()
+    prune(dir, distDir, publicDir, {})
     console.log("[next-with-text] existing routes own every enabled surface")
     return
   }
   const builtPages = await Promise.all(
     routesToBuild.map((route) =>
       buildPage(
-        serverApp,
+        context.pages,
         route,
         gatedRoute(route) ? null : (prerenderedHTML[route] ?? null)
       )
@@ -173,28 +186,38 @@ async function main({
   // route serves everything under next start) so the working tree stays clean,
   // and prune() below removes leftovers from an earlier deploy-shaped build.
   const emitStatic = staticTierEnabled(process.env)
-  // standalone output copies public/ during the build, before this hook runs —
-  // mirror the writes so the copied tree matches (it lives inside .next, so
-  // it's written regardless of the deploy gate)
-  const standalonePublic = join(dir, ".next", "standalone", "public")
   const targets = [
     ...(emitStatic ? [publicDir] : []),
-    ...(existsSync(standalonePublic) ? [standalonePublic] : []),
+    ...(standalonePublic ? [standalonePublic] : []),
   ]
   const written = writeOutputs(writes, targets, emitStatic)
+  cacheRoutes()
 
   reclaimShadowed(
-    [publicDir, ...(existsSync(standalonePublic) ? [standalonePublic] : [])],
+    [publicDir, ...(standalonePublic ? [standalonePublic] : [])],
     pages,
     options.md,
     ownedByUser
   )
-  prune(dir, publicDir, written)
+  prune(dir, distDir, publicDir, written)
   console.log(
     emitStatic
       ? `[next-with-text] generated ${Object.keys(written).length} file(s) into public/`
       : "[next-with-text] local build — public/ untouched; llms surfaces serve on demand (set NEXT_WITH_TEXT_STATIC=1 to write them)"
   )
+
+  function cacheRoutes(): void {
+    const cache = join(distDir, "cache")
+    mkdirSync(cache, { recursive: true })
+    writeFileSync(
+      join(cache, "next-with-text-routes.json"),
+      JSON.stringify(
+        [...prerendered]
+          .filter((route) => !gatedRoute(route))
+          .sort(compareCodeUnits)
+      )
+    )
+  }
 }
 
 async function buildWrites(
@@ -231,6 +254,14 @@ async function buildWrites(
     (renderLlmstxt && hasLlmstxt) || (renderLlmsfulltxt && hasLlmsfulltxt)
       ? await loadTemplates(dir)
       : {}
+  if (renderLlmstxt && hasLlmstxt && !templates.llmstxt) {
+    throw new Error("[next-with-text] could not recover the llmstxt callback")
+  }
+  if (renderLlmsfulltxt && hasLlmsfulltxt && !templates.llmsfulltxt) {
+    throw new Error(
+      "[next-with-text] could not recover the llmsfulltxt callback"
+    )
+  }
   if (renderLlmstxt) {
     writes.push([
       "llms.txt",
@@ -300,11 +331,11 @@ function writeOutputs(
 
 // html is null for a gated route: nothing rendered may be read for it.
 async function buildPage(
-  serverApp: string,
+  modules: CompiledPage[],
   route: string,
   html: string | null
 ): Promise<Page | null> {
-  const override = await pageOverride(serverApp, route)
+  const override = await pageOverride(modules, route)
   if (html === null && !override?.title) {
     return null
   }
@@ -386,25 +417,37 @@ function staticTierEnabled(env: NodeJS.ProcessEnv): boolean {
 // loaderTree to the __PAGE__ leaf's module loader. Each generateStaticParams
 // instance resolves to the same module with its own captured params.
 async function pageOverride(
-  serverApp: string,
+  modules: CompiledPage[],
   route: string
 ): Promise<ResolvedMd | null> {
-  const located = locatePageModule(serverApp, route)
-  if (!located) {
+  const located = modules
+    .toSorted(
+      (a, b) =>
+        Number(a.pattern.includes("[")) - Number(b.pattern.includes("["))
+    )
+    .map((page) => ({ page, params: matchPattern(route, page.pattern) }))
+    .find((candidate) => candidate.params !== null)
+  if (!located?.params) {
     return null
   }
   ;(globalThis as Record<string, unknown>).AsyncLocalStorage ??=
     require("node:async_hooks").AsyncLocalStorage
+  let userland: { md?: unknown } | undefined
   try {
-    const { routeModule } = require(located.pageJs) as CompiledPageModule
+    const { routeModule } = require(located.page.filePath) as CompiledPageModule
     const loader = findPageLoader(routeModule?.userland?.loaderTree)
     if (loader) {
-      const userland = await loader()
-      // static output can't depend on the query string — searchParams is {}
-      return await evaluateMd(userland.md, located.params, {})
+      userland = await loader()
     }
   } catch {
-    // pages that can't load outside the server runtime fall back to HTML conversion
+    // Some page modules need the server runtime; ordinary pages can still
+    // publish their prerendered HTML when their module cannot load here.
+    return null
+  }
+  // Static output cannot depend on a query string. User callback failures are
+  // generation failures, rather than silently replacing their declared body.
+  if (userland) {
+    return evaluateMd(userland.md, located.params, {})
   }
   return null
 }
@@ -428,37 +471,6 @@ function findPageLoader(tree: LoaderTree | undefined): PageLoader | undefined {
     }
     node = parallelRoutes.children
   }
-}
-
-// Maps a concrete route to its compiled page module, resolving [param]
-// directories and collecting what they capture (/tags/alpha →
-// tags/[tag]/page.js with { tag: "alpha" }).
-function locatePageModule(
-  serverApp: string,
-  route: string
-): { pageJs: string; params: Record<string, string> } | null {
-  let dir = serverApp
-  const params: Record<string, string> = {}
-  for (const segment of route.split("/").filter(Boolean)) {
-    if (existsSync(join(dir, segment))) {
-      dir = join(dir, segment)
-      continue
-    }
-    const dynamic = readdirSync(dir, { withFileTypes: true }).find(
-      (entry) =>
-        entry.isDirectory() &&
-        entry.name.startsWith("[") &&
-        entry.name.endsWith("]") &&
-        !entry.name.startsWith("[...")
-    )
-    if (!dynamic) {
-      return null
-    }
-    params[dynamic.name.slice(1, -1)] = segment
-    dir = join(dir, dynamic.name)
-  }
-  const pageJs = join(dir, "page.js")
-  return existsSync(pageJs) ? { pageJs, params } : null
 }
 
 // Re-runs the user's next config through Next's own loader (which handles TS
@@ -493,11 +505,10 @@ async function loadTemplates(dir: string): Promise<Templates> {
           : undefined,
     }
   } catch (err) {
-    console.error(
-      "[next-with-text] failed to load template functions from next.config:",
-      err
+    throw new Error(
+      "[next-with-text] failed to load template functions from next.config",
+      { cause: err }
     )
-    return {}
   } finally {
     ;(globalThis as Record<string, unknown>).__NEXT_WITH_TEXT_CAPTURE__ =
       undefined
@@ -513,12 +524,13 @@ async function loadTemplates(dir: string): Promise<Templates> {
 // next build preserves across builds.
 function prune(
   dir: string,
+  distDir: string,
   publicDir: string,
   written: Record<string, string>
 ): void {
-  const manifestPath = join(dir, ".next", "cache", MANIFEST)
+  const manifestPath = join(distDir, "cache", MANIFEST)
   try {
-    const previous = generatedManifest(dir)
+    const previous = generatedManifest(dir, distDir)
     for (const [rel, hash] of Object.entries(previous)) {
       if (rel in written) {
         continue

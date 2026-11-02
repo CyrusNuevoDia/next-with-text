@@ -68,7 +68,10 @@ function claimed(dir: string): boolean {
 // Dev compiles the codegen'd route live, then deletes it when the server exits
 // so generated scaffolding does not linger in the working tree. Production
 // builds retain it because deployment collectors can trace the source path.
-export function cleanupGeneratedRoute(dir: string): void {
+export function cleanupGeneratedRoute(
+  dir: string,
+  distDir = join(dir, ".next")
+): void {
   const appDir = ["src/app", "app"].map((d) => join(dir, d)).find(existsSync)
   if (!appDir || claimed(dir)) {
     return
@@ -103,8 +106,8 @@ export function cleanupGeneratedRoute(dir: string): void {
   // trades folder noise for a TS2307 in the user's editor. routes.d.ts only
   // holds string literal types — nothing dangles there.
   for (const validator of [
-    join(dir, ".next", "types", "validator.ts"),
-    join(dir, ".next", "dev", "types", "validator.ts"),
+    join(distDir, "types", "validator.ts"),
+    join(distDir, "dev", "types", "validator.ts"),
   ]) {
     scrubValidator(validator)
   }

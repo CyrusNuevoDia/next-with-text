@@ -1,28 +1,24 @@
-import { spawnSync } from "node:child_process"
-import {
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  realpathSync,
-  writeFileSync,
-} from "node:fs"
-import { dirname, join, relative, sep } from "node:path"
+import { existsSync, readFileSync, realpathSync } from "node:fs"
+import { dirname, join, relative, resolve, sep } from "node:path"
 import type { NextConfig } from "next"
+import {
+  adapterField,
+  type BuildPayload,
+  registerAdapter,
+} from "./build-context.js"
 import {
   claimGeneratedRoute,
   cleanupGeneratedRoute,
   releaseGeneratedRoute,
 } from "./cleanup.js"
+import { generateRoute } from "./generated-route.js"
 import {
-  appDir as findAppDir,
+  generatedManifest,
   userAppRoutes,
   userPublicFile,
 } from "./ownership.js"
 import {
-  isPageFile,
   type ResolvedOptions,
-  type RouteOptions,
   resolveOptions,
   type WithTextOptions,
 } from "./shared.js"
@@ -54,18 +50,6 @@ const PHASE_BUILD = "phase-production-build"
 const PHASE_DEV = "phase-development-server"
 const ADAPTER_ENV = "NEXT_WITH_TEXT_UPSTREAM_ADAPTER"
 const PAYLOAD_ENV = "NEXT_WITH_TEXT_BUILD_PAYLOAD"
-const PATCHED_ENV = "NEXT_WITH_TEXT_BUILD_PATCHED"
-function configureAdapter(base: NextConfig, payload: unknown): boolean {
-  const upstreamAdapter = base.adapterPath ?? process.env.NEXT_ADAPTER_PATH
-  if (!upstreamAdapter) {
-    return false
-  }
-  process.env[ADAPTER_ENV] = upstreamAdapter
-  process.env[PAYLOAD_ENV] = JSON.stringify(payload)
-  return true
-}
-
-let patchRegistered = false
 let devCleanupRegistered = false
 
 type Capture = {
@@ -85,10 +69,8 @@ export function withText(
         ? await nextConfig(phase, ctx)
         : nextConfig
 
-    // The build-exit child re-loads this config to reach the template functions
-    // (they can't cross the process boundary as JSON) — hand them over and do
-    // nothing else in that pass, or the child would re-register the exit hook
-    // and recurse.
+    // The generation child reloads config to recover callback closures. Capture
+    // them without registering another adapter or rewriting generated source.
     const capture = (globalThis as { __NEXT_WITH_TEXT_CAPTURE__?: Capture })
       .__NEXT_WITH_TEXT_CAPTURE__
     if (capture) {
@@ -98,9 +80,14 @@ export function withText(
     }
 
     const dir = process.cwd()
+    const distDir = resolve(dir, base.distDir ?? ".next")
     const appRoutes = userAppRoutes(dir)
-    if (phase === PHASE_BUILD || phase === PHASE_DEV) {
-      generateRoute(dir, { ...resolved, dev: phase === PHASE_DEV })
+    if (phase === PHASE_DEV) {
+      generateRoute(dir, {
+        ...resolved,
+        dev: true,
+        distDir: base.distDir ?? ".next",
+      })
     }
     if (phase === PHASE_DEV && !devCleanupRegistered) {
       devCleanupRegistered = true
@@ -115,44 +102,20 @@ export function withText(
       claimGeneratedRoute(dir)
       process.once("exit", () => {
         releaseGeneratedRoute(dir)
-        cleanupGeneratedRoute(dir)
-      })
-    }
-    if (phase === PHASE_BUILD && !patchRegistered) {
-      patchRegistered = true
-      const payload = {
-        dir,
-        hasLlmsfulltxt: typeof options.llmsfulltxt === "function",
-        hasLlmstxt: typeof options.llmstxt === "function",
-        options: resolved,
-      }
-      configureAdapter(base, payload)
-      // Platforms expose an adapter callback before they collect build output;
-      // builds without one fall back to exit, whose handler must stay sync.
-      process.once("exit", (code) => {
-        if (code === 0 && process.env[PATCHED_ENV] !== "1") {
-          // Published installs resolve beside index.cjs; a TS-aware config loader
-          // can still execute src/index.ts directly, so check dist/ as well.
-          const patch = [
-            join(moduleDir, "patch.cjs"),
-            join(moduleDir, "..", "dist", "patch.cjs"),
-          ].find(existsSync)
-          if (patch) {
-            spawnSync(process.execPath, [patch, JSON.stringify(payload)], {
-              stdio: "inherit",
-            })
-          } else {
-            console.error(
-              "[next-with-text] patch.cjs not found — run the package build"
-            )
-          }
-        }
+        cleanupGeneratedRoute(dir, distDir)
       })
     }
 
     const config: NextConfig = {
       ...base,
-      rewrites: composeRewrites(base.rewrites, resolved, dir, appRoutes),
+      rewrites: composeRewrites(
+        base.rewrites,
+        resolved,
+        dir,
+        appRoutes,
+        distDir,
+        phase
+      ),
       // the converter is a native addon — Turbopack can't bundle it into the
       // generated route handler
       serverExternalPackages: [
@@ -164,15 +127,51 @@ export function withText(
         base.outputFileTracingIncludes,
         dir
       )
-    }
-    if (
-      phase === PHASE_BUILD &&
-      (base.adapterPath ?? process.env.NEXT_ADAPTER_PATH)
-    ) {
-      config.adapterPath = join(moduleDir, "adapter.cjs")
+      return configureAdapter(config, dir, options, resolved)
     }
     return config
   }
+}
+
+function configureAdapter(
+  config: NextConfig,
+  dir: string,
+  options: WithTextOptions,
+  resolved: ResolvedOptions
+): NextConfig {
+  const version = JSON.parse(
+    readFileSync(require.resolve("next/package.json", { paths: [dir] }), "utf8")
+  ).version as string
+  const field = adapterField(version)
+  const experimental = config.experimental as typeof config.experimental & {
+    adapterPath?: string
+  }
+  const upstream =
+    config.adapterPath ??
+    experimental?.adapterPath ??
+    process.env.NEXT_ADAPTER_PATH
+  if (upstream) {
+    process.env[ADAPTER_ENV] = upstream
+  } else {
+    delete process.env[ADAPTER_ENV]
+  }
+  process.env.NEXT_WITH_TEXT_ADAPTER_FIELD = field
+  // Turbopack replays raw config after modifyConfig without calling the
+  // adapter again. Only the adapter may replace the final build directory.
+  const previous = process.env[PAYLOAD_ENV]
+    ? (JSON.parse(process.env[PAYLOAD_ENV]) as BuildPayload)
+    : undefined
+  process.env[PAYLOAD_ENV] = JSON.stringify({
+    distDir:
+      previous?.projectDir === dir
+        ? previous.distDir
+        : (config.distDir ?? ".next"),
+    hasLlmsfulltxt: typeof options.llmsfulltxt === "function",
+    hasLlmstxt: typeof options.llmstxt === "function",
+    options: resolved,
+    projectDir: dir,
+  } satisfies BuildPayload)
+  return registerAdapter(config, join(moduleDir, "adapter.cjs"), field)
 }
 
 const LLMS_ROUTE = "/_llms/**"
@@ -224,103 +223,6 @@ function findPackage(name: string, from: string): string | null {
   return parent === from ? null : findPackage(name, parent)
 }
 
-function generateRoute(dir: string, options: RouteOptions): void {
-  const appDir = findAppDir(dir)
-  if (!appDir) {
-    return
-  }
-  // %5F is the URL-encoded underscore: a literal `_llms` folder is
-  // routing-private and never mounts; this one serves /_llms/:path.
-  const routeDir = join(appDir, "%5Fllms", "[...path]")
-  const routeFile = join(routeDir, "route.ts")
-  const loaders = scanMdPages(appDir)
-    .map(
-      ({ pattern, importPath }) =>
-        `  ${JSON.stringify(pattern)}: () => import(${JSON.stringify(importPath)}),`
-    )
-    .join("\n")
-  const manifest = loaders === "" ? "{}" : `{\n${loaders}\n}`
-  const content = `// Generated by next-with-text at config load. Retained by builds for deployment
-// tracing; deleted when the development server exits — do not edit.
-import { createHandler } from "next-with-text/route"
-
-export const GET = createHandler(${JSON.stringify(options)}, ${manifest})
-`
-  try {
-    if (existsSync(routeFile) && readFileSync(routeFile, "utf8") === content) {
-      return
-    }
-    mkdirSync(routeDir, { recursive: true })
-    writeFileSync(routeFile, content)
-  } catch {
-    // read-only filesystem (serverless runtime) — the route was generated at build time
-  }
-}
-
-// Pages exporting `md` get a static dynamic-import in the generated route so
-// the on-demand tier can evaluate the export in every runtime — dev, start,
-// serverless — through the bundler instead of loading source at request time.
-function scanMdPages(
-  appDir: string
-): Array<{ pattern: string; importPath: string }> {
-  const pages: Array<{ pattern: string; importPath: string }> = []
-  walk(appDir, "")
-  return pages
-
-  function walk(dirPath: string, route: string): void {
-    for (const entry of readdirSync(dirPath, { withFileTypes: true })) {
-      const { name } = entry
-      if (entry.isDirectory()) {
-        if (isIgnoredAppDirectory(name)) {
-          continue
-        }
-        walk(
-          join(dirPath, name),
-          name.startsWith("(") ? route : `${route}/${name}`
-        )
-        continue
-      }
-      addMdPage(pages, appDir, dirPath, route, name)
-    }
-  }
-}
-
-function addMdPage(
-  pages: Array<{ pattern: string; importPath: string }>,
-  appDir: string,
-  dirPath: string,
-  route: string,
-  name: string
-): void {
-  if (
-    !(
-      isPageFile(name) &&
-      MD_EXPORT.test(readFileSync(join(dirPath, name), "utf8"))
-    )
-  ) {
-    return
-  }
-  const relativePage = relative(appDir, join(dirPath, name))
-    .split(sep)
-    .join("/")
-  const rel = relativePage.slice(0, relativePage.lastIndexOf("."))
-  pages.push({
-    importPath: `../../${rel}`,
-    pattern: route === "" ? "/" : route,
-  })
-}
-
-const MD_EXPORT = /export\s+(?:const|let|var|async\s+function|function)\s+md\b/
-
-function isIgnoredAppDirectory(name: string): boolean {
-  return (
-    name.startsWith("_") ||
-    name.startsWith("%5F") ||
-    name.startsWith("@") ||
-    name.startsWith("[...")
-  )
-}
-
 type RewritesFn = NonNullable<NextConfig["rewrites"]>
 type RewriteRule =
   Awaited<ReturnType<RewritesFn>> extends infer R
@@ -329,13 +231,36 @@ type RewriteRule =
       : never
     : never
 
+function manifestForRewrites(
+  dir: string,
+  distDir: string,
+  phase: string
+): Record<string, string> {
+  // Next asks for rewrites after adapter.modifyConfig. Its final distDir can
+  // differ from the user's initial config, including where ownership lives.
+  if (phase !== PHASE_BUILD) {
+    return generatedManifest(dir, distDir)
+  }
+  const payload = JSON.parse(
+    process.env[PAYLOAD_ENV] ?? "{}"
+  ) as Partial<BuildPayload>
+  const finalDistDir =
+    payload.projectDir === dir && payload.distDir
+      ? resolve(dir, payload.distDir)
+      : distDir
+  return generatedManifest(dir, finalDistDir)
+}
+
 function composeRewrites(
   userRewrites: NextConfig["rewrites"],
   options: ResolvedOptions,
   dir: string,
-  appRoutes: Set<string>
+  appRoutes: Set<string>,
+  distDir: string,
+  phase: string
 ): RewritesFn {
   return async () => {
+    const manifest = manifestForRewrites(dir, distDir, phase)
     const user = userRewrites ? await userRewrites() : []
     const groups = Array.isArray(user)
       ? {
@@ -380,11 +305,16 @@ function composeRewrites(
             : `/:path((?!(?:${customMd.join("|")})$).*\\.md)`,
       })
     }
-    if (!(appRoutes.has("llms.txt") || userPublicFile(dir, "llms.txt"))) {
+    if (
+      !(appRoutes.has("llms.txt") || userPublicFile(dir, "llms.txt", manifest))
+    ) {
       afterFiles.push({ destination: "/_llms/llms.txt", source: "/llms.txt" })
     }
     if (
-      !(appRoutes.has("llms-full.txt") || userPublicFile(dir, "llms-full.txt"))
+      !(
+        appRoutes.has("llms-full.txt") ||
+        userPublicFile(dir, "llms-full.txt", manifest)
+      )
     ) {
       afterFiles.push({
         destination: "/_llms/llms-full.txt",

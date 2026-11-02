@@ -1,5 +1,6 @@
 import { writeFileSync } from "node:fs"
 import { join } from "node:path"
+import type { NextConfig } from "next"
 import { type WithTextOptions, withText } from "next-with-text"
 
 const options: WithTextOptions = { exclude: ["/docs/internal/**"] }
@@ -19,6 +20,11 @@ if (process.env.LLMSTXT_FN === "throw") {
   options.llmstxt = () => {
     writeFileSync(join(process.cwd(), "llmstxt-invoked"), "yes")
     return "unexpected generated index"
+  }
+}
+if (process.env.LLMSTXT_FN === "error") {
+  options.llmstxt = () => {
+    throw new Error("TEMPLATE_CALLBACK_FAILURE")
   }
 }
 if (process.env.LLMSFULLTXT_FN === "1") {
@@ -44,7 +50,10 @@ if (process.env.MD_OFF === "1") {
 }
 
 // Standalone output copies only traced files, like a serverless deploy bundle.
-export default withText(
-  process.env.STANDALONE === "1" ? { output: "standalone" } : {},
-  options
-)
+const config = {
+  adapterPath: process.env.ADAPTER_DIST_DIR
+    ? join(process.cwd(), "adapter-probe.cjs")
+    : undefined,
+  output: process.env.STANDALONE === "1" ? "standalone" : undefined,
+} satisfies NextConfig
+export default withText(config, options)
