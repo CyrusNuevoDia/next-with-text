@@ -1,16 +1,5 @@
-import { spawnSync } from "node:child_process"
-import {
-  copyFileSync,
-  cpSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs"
 import { createRequire } from "node:module"
-import { tmpdir } from "node:os"
-import { dirname, isAbsolute, join, relative, resolve } from "node:path"
+import { dirname, isAbsolute, join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 import type { NextConfig } from "next"
 import {
@@ -19,6 +8,7 @@ import {
   registerAdapter,
 } from "./build-context.js"
 import { generateRoute } from "./generated-route.js"
+import { finishStandalone, generate } from "./generation.js"
 import { withPageExports } from "./page-exports.js"
 
 type Adapter = {
@@ -103,68 +93,21 @@ const adapter = {
     }
     // Validate auth guards before invoking a child that can write public files.
     const context = buildContext(ctx)
-    const handoff = mkdtempSync(join(tmpdir(), "next-with-text-"))
-    try {
-      // File transport avoids Linux's single-argv limit on large route lists.
-      const contextFile = join(handoff, "build-context.json")
-      writeFileSync(contextFile, JSON.stringify(context))
-      const patch = spawnSync(
-        process.execPath,
-        [join(moduleDir, "patch.cjs"), payload, contextFile],
-        { stdio: "inherit" }
-      )
-      if (patch.error || patch.status !== 0) {
-        throw new Error("[next-with-text] generation failed", {
-          cause: patch.error,
-        })
-      }
-      const { standaloneDir } = context
-      if (standaloneDir) {
-        const staging = join(
-          context.distDir,
-          "cache",
-          "next-with-text-standalone"
-        )
-        const target = join(standaloneDir, "public")
-        const cacheTarget = join(
-          standaloneDir,
-          relative(context.projectDir, context.distDir),
-          "cache",
-          "next-with-text-routes.json"
-        )
-        // Next deletes/rebuilds standalone after this hook. Generation has
-        // already succeeded; exit only copies its staged files into that tree.
-        process.once("exit", (code) => {
-          try {
-            if (code === 0) {
-              if (!existsSync(standaloneDir)) {
-                throw new Error("standalone output was not created")
-              }
-              mkdirSync(target, { recursive: true })
-              cpSync(staging, target, {
-                errorOnExist: false,
-                force: false,
-                recursive: true,
-              })
-              mkdirSync(dirname(cacheTarget), { recursive: true })
-              copyFileSync(
-                join(context.distDir, "cache", "next-with-text-routes.json"),
-                cacheTarget
-              )
-            }
-          } catch (error) {
-            console.error(
-              "[next-with-text] standalone finalization failed:",
-              error
-            )
-            process.exitCode = 1
-          } finally {
-            rmSync(staging, { force: true, recursive: true })
-          }
-        })
-      }
-    } finally {
-      rmSync(handoff, { force: true, recursive: true })
+    generate(payload, context)
+    if (context.standaloneDir) {
+      // Next deletes/rebuilds standalone after this hook. Generation has
+      // already succeeded; exit only copies its staged files into that tree.
+      process.once("exit", (code) => {
+        try {
+          finishStandalone(context, code === 0)
+        } catch (error) {
+          console.error(
+            "[next-with-text] standalone finalization failed:",
+            error
+          )
+          process.exitCode = 1
+        }
+      })
     }
     const upstreamAdapter = await upstream(context.projectDir)
     await upstreamAdapter?.onBuildComplete?.(ctx)

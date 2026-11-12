@@ -4,6 +4,7 @@ import type { NextConfig } from "next"
 import {
   adapterField,
   type BuildPayload,
+  legacyBuildContext,
   registerAdapter,
 } from "./build-context.js"
 import {
@@ -12,11 +13,13 @@ import {
   releaseGeneratedRoute,
 } from "./cleanup.js"
 import { generateRoute } from "./generated-route.js"
+import { finishStandalone, generate } from "./generation.js"
 import {
   generatedManifest,
   userAppRoutes,
   userPublicFile,
 } from "./ownership.js"
+import { withPageExports } from "./page-exports.js"
 import {
   type ResolvedOptions,
   resolveOptions,
@@ -127,13 +130,13 @@ export function withText(
         base.outputFileTracingIncludes,
         dir
       )
-      return configureAdapter(config, dir, options, resolved)
+      return configureBuild(config, dir, options, resolved)
     }
     return config
   }
 }
 
-function configureAdapter(
+function configureBuild(
   config: NextConfig,
   dir: string,
   options: WithTextOptions,
@@ -150,28 +153,71 @@ function configureAdapter(
     config.adapterPath ??
     experimental?.adapterPath ??
     process.env.NEXT_ADAPTER_PATH
-  if (upstream) {
-    process.env[ADAPTER_ENV] = upstream
-  } else {
-    delete process.env[ADAPTER_ENV]
-  }
-  process.env.NEXT_WITH_TEXT_ADAPTER_FIELD = field
   // Turbopack replays raw config after modifyConfig without calling the
   // adapter again. Only the adapter may replace the final build directory.
   const previous = process.env[PAYLOAD_ENV]
     ? (JSON.parse(process.env[PAYLOAD_ENV]) as BuildPayload)
     : undefined
-  process.env[PAYLOAD_ENV] = JSON.stringify({
+  const payload = {
     distDir:
-      previous?.projectDir === dir
+      upstream && previous?.projectDir === dir
         ? previous.distDir
         : (config.distDir ?? ".next"),
     hasLlmsfulltxt: typeof options.llmsfulltxt === "function",
     hasLlmstxt: typeof options.llmstxt === "function",
     options: resolved,
     projectDir: dir,
-  } satisfies BuildPayload)
+  } satisfies BuildPayload
+  process.env[PAYLOAD_ENV] = JSON.stringify(payload)
+  if (!upstream) {
+    // Any adapterPath makes Next store prerenders under server/route-cache,
+    // which platforms reading .next directly (Vercel's builder) can't find.
+    // With no adapter to compose with, generate from Next's own manifests.
+    delete process.env[ADAPTER_ENV]
+    generateRoute(dir, { ...resolved, dev: false, distDir: payload.distDir })
+    registerBuildExit(dir, resolve(dir, payload.distDir))
+    return {
+      ...config,
+      compiler: {
+        ...config.compiler,
+        runAfterProductionCompile: withPageExports(
+          config.compiler?.runAfterProductionCompile
+        ),
+      },
+    }
+  }
+  process.env[ADAPTER_ENV] = upstream
+  process.env.NEXT_WITH_TEXT_ADAPTER_FIELD = field
   return registerAdapter(config, join(moduleDir, "adapter.cjs"), field)
+}
+
+const OWNER_ENV = "NEXT_WITH_TEXT_BUILD_OWNER"
+let buildExitRegistered = false
+
+function registerBuildExit(dir: string, distDir: string): void {
+  // Next's build workers load this config too and inherit the build's env;
+  // only the process that ran the build may generate from its output.
+  const owner = process.env[OWNER_ENV]
+  if (buildExitRegistered || (owner && owner !== String(process.pid))) {
+    return
+  }
+  buildExitRegistered = true
+  process.env[OWNER_ENV] = String(process.pid)
+  // Next has written its manifests and standalone tree by exit, and a
+  // platform builder reads public/ only after `next build` exits.
+  process.once("exit", (code) => {
+    if (code !== 0) {
+      return
+    }
+    try {
+      const context = legacyBuildContext(dir, distDir)
+      generate(process.env[PAYLOAD_ENV] ?? "", context)
+      finishStandalone(context, true)
+    } catch (error) {
+      console.error("[next-with-text] generation failed:", error)
+      process.exitCode = 1
+    }
+  })
 }
 
 const LLMS_ROUTE = "/_llms/**"

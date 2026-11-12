@@ -1,5 +1,6 @@
-// Generation runs only from Next’s adapter completion hook. Its normalized
-// context names each artifact; no build directory discovery is needed here.
+// Generation runs from Next’s adapter completion hook, or at build exit when no
+// adapter is configured. Either way the caller hands over a normalized context
+// naming each artifact; no build directory discovery happens here.
 
 import {
   existsSync,
@@ -60,9 +61,7 @@ const [, , payloadJSON, contextFile] = process.argv
 Promise.resolve()
   .then(() => {
     if (!(payloadJSON && contextFile)) {
-      throw new Error(
-        "[next-with-text] generation requires adapter build context"
-      )
+      throw new Error("[next-with-text] generation requires build context")
     }
     return main(
       JSON.parse(payloadJSON) as BuildPayload,

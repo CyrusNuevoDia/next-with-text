@@ -1,3 +1,4 @@
+import { existsSync, readFileSync } from "node:fs"
 import { isAbsolute, join, relative } from "node:path"
 import type { NextConfig } from "next"
 import {
@@ -102,25 +103,17 @@ export function buildContext(input: unknown): BuildContext {
       }
     }
   )
-  const pages = new Map<string, CompiledPage>()
-  for (const page of appPages.toSorted(
-    (a, b) =>
-      Number(a.sourcePage.includes("/@")) - Number(b.sourcePage.includes("/@"))
-  )) {
-    // Next emits an RSC sibling with the same module. sourcePage names the
-    // canonical route independently of that extra pathname and of disk layout.
-    const pattern = normalizeAppPath(page.sourcePage)
-    if (page.pathname !== pattern || privateRoute(pattern)) {
-      continue
-    }
-    if (!pages.has(pattern)) {
-      pages.set(pattern, { filePath: page.filePath, pattern })
-    }
-  }
+  // Next emits an RSC sibling with the same module. sourcePage names the
+  // canonical route independently of that extra pathname and of disk layout.
+  const pages = canonicalPages(
+    appPages.filter(
+      (page) => page.pathname === normalizeAppPath(page.sourcePage)
+    )
+  )
   return {
     basePath,
     distDir,
-    pages: [...pages.values()],
+    pages,
     prerenderedHTML: adapterPrerenders({ appPages, prerenders }, basePath),
     projectDir,
     proxyMatchers: middlewareMatchers(outputs.middleware),
@@ -142,6 +135,131 @@ export function buildContext(input: unknown): BuildContext {
   }
 }
 
+// Without an adapter, Next keeps its legacy layout (server/app/<route>.html)
+// and describes the build only through its manifests. Registering an adapter
+// just to read outputs would move prerenders into server/route-cache, which
+// platforms that read .next directly (Vercel's builder) cannot find.
+export function legacyBuildContext(
+  projectDir: string,
+  distDir: string
+): BuildContext {
+  const read = (rel: string) =>
+    JSON.parse(readFileSync(join(distDir, rel), "utf8")) as unknown
+  const server = join(distDir, "server")
+  const appPaths = object(
+    read("server/app-paths-manifest.json"),
+    "app paths manifest"
+  )
+  const pages = canonicalPages(
+    Object.entries(appPaths)
+      .filter(([sourcePage]) => sourcePage.endsWith("/page"))
+      .map(([sourcePage, file]) => ({
+        filePath: join(server, string(file, "app page file")),
+        sourcePage,
+      }))
+  )
+  const prerenderedHTML: PrerenderedHTML = {}
+  const routes = object(
+    object(read("prerender-manifest.json"), "prerender manifest").routes,
+    "prerender routes"
+  )
+  for (const [route, value] of Object.entries(routes)) {
+    const entry = object(value, "prerender route")
+    if (
+      (entry.routeType ?? "page") !== "page" ||
+      route.includes("[") ||
+      privateRoute(route)
+    ) {
+      continue
+    }
+    const base = join(server, "app", route === "/" ? "index" : route.slice(1))
+    // App Router HTML lives here; Pages Router prerenders live elsewhere. A
+    // postponed shell is not the page's content.
+    if (!existsSync(`${base}.html`) || postponed(`${base}.meta`)) {
+      continue
+    }
+    prerenderedHTML[route] = `${base}.html`
+  }
+  const proxyMatchers = [
+    ...Object.values(
+      object(
+        object(
+          read("server/functions-config-manifest.json"),
+          "functions config manifest"
+        ).functions ?? {},
+        "functions"
+      )
+    ),
+    ...Object.values(
+      object(
+        object(read("server/middleware-manifest.json"), "middleware manifest")
+          .middleware ?? {},
+        "middleware"
+      )
+    ),
+  ].flatMap((value) =>
+    array(object(value, "proxy function").matchers ?? [], "matchers").flatMap(
+      (input) => {
+        const matcher = object(input, "proxy matcher")
+        const source = regex(matcher.regexp, "proxy matcher regexp")
+        return unconditional(matcher) ? [source] : []
+      }
+    )
+  )
+  const routesManifest = object(read("routes-manifest.json"), "routes manifest")
+  const serverConfig = object(
+    object(read("required-server-files.json"), "required server files").config,
+    "server config"
+  )
+  return {
+    basePath: string(routesManifest.basePath ?? "", "basePath"),
+    distDir,
+    pages,
+    prerenderedHTML,
+    projectDir,
+    proxyMatchers,
+    ...(serverConfig.output === "standalone"
+      ? {
+          standaloneDir: join(
+            distDir,
+            "standalone",
+            relative(
+              absolutePath(
+                serverConfig.outputFileTracingRoot,
+                "config.outputFileTracingRoot"
+              ),
+              projectDir
+            )
+          ),
+        }
+      : {}),
+  }
+}
+
+function postponed(metaFile: string): boolean {
+  if (!existsSync(metaFile)) {
+    return false
+  }
+  const meta = object(JSON.parse(readFileSync(metaFile, "utf8")), "page meta")
+  return meta.postponed !== undefined && meta.postponed !== null
+}
+
+function canonicalPages(
+  candidates: Array<{ filePath: string; sourcePage: string }>
+): CompiledPage[] {
+  const pages = new Map<string, CompiledPage>()
+  for (const page of candidates.toSorted(
+    (a, b) =>
+      Number(a.sourcePage.includes("/@")) - Number(b.sourcePage.includes("/@"))
+  )) {
+    const pattern = normalizeAppPath(page.sourcePage)
+    if (!(privateRoute(pattern) || pages.has(pattern))) {
+      pages.set(pattern, { filePath: page.filePath, pattern })
+    }
+  }
+  return [...pages.values()]
+}
+
 function middlewareMatchers(input: unknown): string[] {
   if (input === undefined) {
     return []
@@ -150,28 +268,31 @@ function middlewareMatchers(input: unknown): string[] {
   const config = object(middleware.config, "middleware config")
   return array(config.matchers, "middleware matchers").flatMap((value) => {
     const matcher = object(value, "middleware matcher")
-    const source = string(matcher.sourceRegex, "middleware sourceRegex")
-    // Validate even conditional matchers: malformed guards must not quietly
-    // turn into publishable routes after a Next upgrade.
-    const expression = new RegExp(source)
-    const has =
-      matcher.has === undefined
-        ? []
-        : array(matcher.has, "matcher has").map(matcherCondition)
-    const missing =
-      matcher.missing === undefined
-        ? []
-        : array(matcher.missing, "matcher missing").map(matcherCondition)
-    const userMissing = missing.filter((condition) => {
-      // Next adds this internal bypass to every proxy, including plain path
-      // guards. It isn't a user condition making the route public.
-      return !(
-        condition.type === "header" &&
-        condition.key === "x-prerender-revalidate"
-      )
-    })
-    return has.length || userMissing.length ? [] : [expression.source]
+    const source = regex(matcher.sourceRegex, "middleware sourceRegex")
+    return unconditional(matcher) ? [source] : []
   })
+}
+
+// Validate even conditional matchers: malformed guards must not quietly turn
+// into publishable routes after a Next upgrade. Only an unconditional matcher
+// guards a route outright; `has: accept` alone would exclude every page.
+function unconditional(matcher: Record<string, unknown>): boolean {
+  const has =
+    matcher.has === undefined
+      ? []
+      : array(matcher.has, "matcher has").map(matcherCondition)
+  const missing =
+    matcher.missing === undefined
+      ? []
+      : array(matcher.missing, "matcher missing").map(matcherCondition)
+  const userMissing = missing.filter((condition) => {
+    // Next adds this internal bypass to every proxy, including plain path
+    // guards. It isn't a user condition making the route public.
+    return !(
+      condition.type === "header" && condition.key === "x-prerender-revalidate"
+    )
+  })
+  return !(has.length || userMissing.length)
 }
 
 function matcherCondition(value: unknown): Record<string, unknown> {
@@ -232,6 +353,12 @@ function string(value: unknown, name: string): string {
     throw new Error(`[next-with-text] invalid ${name}`)
   }
   return value
+}
+
+// Compiling rejects a malformed guard instead of letting it publish routes.
+function regex(value: unknown, name: string): string {
+  const { source } = new RegExp(string(value, name))
+  return source
 }
 
 function absolutePath(value: unknown, name: string): string {

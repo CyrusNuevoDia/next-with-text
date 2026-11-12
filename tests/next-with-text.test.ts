@@ -819,6 +819,38 @@ describe("next start", () => {
   })
 })
 
+// Any adapterPath moves Next's prerenders into server/route-cache, and Vercel's
+// builder (without NEXT_ENABLE_ADAPTER) still reads server/app/<route>.rsc. A
+// plain deploy build must leave Next's layout alone and still generate.
+describe("deploy build without an adapter", () => {
+  beforeAll(async () => {
+    cleanFixture()
+    await buildFixture()
+  })
+
+  test("Next keeps its legacy prerender layout", () => {
+    const server = join(FIXTURE, ".next", "server")
+    expect(existsSync(join(server, "route-cache"))).toBe(false)
+    expect(existsSync(join(server, "app", "about.rsc"))).toBe(true)
+    expect(existsSync(join(server, "app", "about.html"))).toBe(true)
+  })
+
+  test("a route-group page publishes its md export at the route's own path", () => {
+    expect(readFileSync(join(PUBLIC, "about.md"), "utf8")).toContain(
+      "MD_OVERRIDE_ABOUT"
+    )
+    const index = readFileSync(join(PUBLIC, "llms.txt"), "utf8")
+    expect(index).toContain("](/about.md)")
+    expect(index).not.toContain("(marketing)")
+  })
+
+  test("proxy guards and exclusions still hold", () => {
+    for (const rel of NEVER_GENERATED) {
+      expect(existsSync(join(PUBLIC, rel))).toBe(false)
+    }
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Check 23 — the `llmstxt` function owns the entire llms.txt body.
 // Runs last: it rebuilds the fixture with LLMSTXT_FN=1.
