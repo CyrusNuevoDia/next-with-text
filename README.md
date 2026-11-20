@@ -29,7 +29,7 @@ No route handlers to write, no middleware, no config files, no route lists to ma
 
 Building locally leaves nothing behind: the generated files exist only for the deploy build that needs them ([details](#generated-files-clean-up-after-themselves)).
 
-Requires Next.js 16.x and the App Router. Both ESM imports and CommonJS `require()` are supported.
+Requires Next.js 16.x, the App Router, and Node.js 20.9 or newer. Both ESM imports and CommonJS `require()` are supported.
 
 ## How it works
 
@@ -238,14 +238,17 @@ bun run test   # builds the library, then runs the verifier suite against tests/
 
 The test suite builds a fixture Next app, inspects the build output, and asserts over HTTP against `next start` and `next dev` — including auth exclusion, cookie-forwarded on-demand conversion, and Accept negotiation.
 
-CI also installs the packed package into fresh consumers and checks both webpack and Turbopack at fixed Next.js 16 compatibility checkpoints, including the 16.3.8 output layout change, and the latest stable 16.x release. Each run prints the exact version tested. To run one compatibility case after building the package:
+CI installs a single tarball into fresh apps and checks both webpack and Turbopack, with and without an adapter. Pull requests run compatibility checkpoints. Scheduled and manual CI runs discover every stable Next.js 16 patch from npm, including backports. The release workflow runs the full matrix against the exact tarball it publishes.
+
+If a reviewed Next.js security stop prevents a build, the matrix checks a plain Next.js app on the same version and bundler. The report records a confirmed stop as upstream-blocked. To run one case locally:
 
 ```bash
 bun run build
-NEXT_COMPAT_VERSION=16.0.0 NEXT_COMPAT_BUNDLER=webpack bun test tests/compatibility.test.ts
+NEXT_COMPAT_VERSION=16.0.0 NEXT_COMPAT_BUNDLER=webpack \
+  NEXT_COMPAT_MODE=adapter bun test tests/compatibility.test.ts
 ```
 
-Set `NEXT_WITH_TEXT_TARBALL` to an absolute tarball path to verify an existing package artifact. The compatibility runner and package tests use that artifact without rebuilding it.
+Use `NEXT_COMPAT_MODE=plain` to exercise the build without an adapter. Set `NEXT_WITH_TEXT_TARBALL` to an absolute path to test an existing archive. To run the release checks without publishing, dispatch the release workflow with `verify_only` enabled.
 
 ## License
 

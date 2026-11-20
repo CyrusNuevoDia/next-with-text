@@ -10,6 +10,10 @@ on:
         description: Exact version commit to build and publish
         required: false
         type: string
+      verify_only:
+        description: Verify the release tarball and full compatibility without publishing
+        default: false
+        type: boolean
 
 concurrency:
   group: release-${{ github.ref }}
@@ -21,6 +25,7 @@ jobs:
       actions: write
       contents: write
     outputs:
+      candidate: ${{ steps.release.outputs.candidate }}
       publish: ${{ steps.release.outputs.publish }}
       release_sha: ${{ steps.release.outputs.release_sha }}
     steps:
@@ -48,9 +53,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_RELEASE_SHA: ${{ inputs.release_sha }}
+          VERIFY_ONLY: ${{ inputs.verify_only }}
         run: |
+          echo "candidate=false" >> "$GITHUB_OUTPUT"
           echo "publish=false" >> "$GITHUB_OUTPUT"
           echo "release_sha=" >> "$GITHUB_OUTPUT"
+
+          if [[ "$VERIFY_ONLY" == true ]]; then
+            echo "candidate=true" >> "$GITHUB_OUTPUT"
+            echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           if [[ -n "$REQUESTED_RELEASE_SHA" ]]; then
             actual_sha="$(git rev-parse HEAD)"
@@ -62,6 +75,7 @@ jobs:
               echo "Release commit still contains changesets" >&2
               exit 1
             fi
+            echo "candidate=true" >> "$GITHUB_OUTPUT"
             echo "publish=true" >> "$GITHUB_OUTPUT"
             echo "release_sha=$actual_sha" >> "$GITHUB_OUTPUT"
             exit 0
@@ -92,7 +106,7 @@ jobs:
           echo "Dispatched publication run for $release_sha"
 
   build:
-    if: needs.prepare.outputs.publish == 'true'
+    if: needs.prepare.outputs.candidate == 'true'
     needs: prepare
     runs-on: ubuntu-latest
     permissions:
@@ -121,6 +135,9 @@ jobs:
           bun run build
           npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/release"
           echo "version=$(jq -r '.version' package.json)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20.9.0"
       - name: verify-package
         run: |
           packages=("$RUNNER_TEMP"/release/*.tgz)
@@ -133,8 +150,18 @@ jobs:
           path: ${{ runner.temp }}/release/*.tgz
           if-no-files-found: error
 
-  publish-npm:
+  compatibility:
+    if: needs.prepare.outputs.candidate == 'true'
     needs: [prepare, build]
+    uses: ./.github/workflows/compatibility.yml
+    with:
+      artifact: npm-package
+      ref: ${{ needs.prepare.outputs.release_sha }}
+      scope: full
+
+  publish-npm:
+    if: needs.prepare.outputs.publish == 'true'
+    needs: [prepare, build, compatibility]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -153,6 +180,13 @@ jobs:
         with:
           name: npm-package
           path: ${{ runner.temp }}/release/npm
+      - name: Match tested tarball
+        env:
+          DIGEST: ${{ needs.compatibility.outputs.digest }}
+        run: |
+          packages=("$RUNNER_TEMP"/release/npm/*.tgz)
+          [[ ${#packages[@]} -eq 1 && -f "${packages[0]}" ]]
+          [[ "$(sha512sum "${packages[0]}" | cut -d ' ' -f 1)" == "$DIGEST" ]]
       - id: registry
         name: inspect[npm]
         env:
