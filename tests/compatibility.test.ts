@@ -35,7 +35,9 @@ const ENABLED =
 const MODE = process.env.NEXT_COMPAT_MODE ?? "plain"
 const FROM_PARENT = process.env.NEXT_COMPAT_FROM_PARENT === "1"
 const BASE_PATH = process.env.NEXT_COMPAT_BASE_PATH === "1"
-const INDEX_REGRESSION = VERSION === "16.4.6" && MODE === "plain"
+// Webpack's own prerenderer fails on this route before generation runs.
+const INDEX_REGRESSION =
+  VERSION === "16.4.6" && BUNDLER === "turbopack" && MODE === "plain"
 const DIST_DIR = MODE === "adapter" ? ".compat-next-final" : ".compat-next"
 const EXACT_NEXT_VERSION = /^16\.\d+\.\d+$/
 
