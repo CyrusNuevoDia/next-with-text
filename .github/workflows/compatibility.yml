@@ -1,0 +1,169 @@
+name: Next 16 compatibility
+
+on:
+  workflow_call:
+    inputs:
+      scope:
+        required: true
+        type: string
+      ref:
+        required: true
+        type: string
+      artifact:
+        description: Existing npm tarball artifact from the calling run
+        type: string
+        default: ""
+    outputs:
+      digest:
+        value: ${{ jobs.prepare.outputs.digest }}
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      archive: ${{ steps.plan.outputs.archive }}
+      digest: ${{ steps.plan.outputs.digest }}
+      sha: ${{ steps.plan.outputs.sha }}
+      versions: ${{ steps.plan.outputs.versions }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - if: inputs.artifact == ''
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+          mkdir -p candidate
+          npm pack --ignore-scripts --pack-destination candidate
+      - if: inputs.artifact != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.artifact }}
+          path: candidate
+      - id: plan
+        env:
+          COMPAT_SCOPE: ${{ inputs.scope }}
+          INPUT_ARTIFACT: ${{ inputs.artifact }}
+          EXPECTED_SHA: ${{ inputs.ref }}
+        run: |
+          [[ "$COMPAT_SCOPE" == full || "$COMPAT_SCOPE" == checkpoints ]]
+          sha="$(git rev-parse HEAD)"
+          [[ "$sha" == "$EXPECTED_SHA" ]]
+          packages=(candidate/*.tgz)
+          [[ ${#packages[@]} -eq 1 && -f "${packages[0]}" ]]
+          npm view 'next@16' version --json --registry=https://registry.npmjs.org > inventory.json
+          bun tests/compatibility-report.ts plan inventory.json "${packages[0]}" "$sha"
+          echo "archive=${INPUT_ARTIFACT:-compatibility-tarball}" >> "$GITHUB_OUTPUT"
+          echo "digest=$(jq -r .digest plan.json)" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - if: inputs.artifact == ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: compatibility-tarball
+          path: candidate/*.tgz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: compatibility-plan
+          path: plan.json
+          if-no-files-found: error
+
+  cases:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        next: ${{ fromJSON(needs.prepare.outputs.versions) }}
+        bundler: [webpack, turbopack]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.prepare.outputs.archive }}
+          path: candidate
+      - name: Build both adapter modes in parallel
+        env:
+          NEXT_COMPAT_VERSION: ${{ matrix.next }}
+          NEXT_COMPAT_BUNDLER: ${{ matrix.bundler }}
+          NEXT_COMPAT_SHA: ${{ needs.prepare.outputs.sha }}
+          DIGEST: ${{ needs.prepare.outputs.digest }}
+        run: |
+          packages=(candidate/*.tgz)
+          [[ ${#packages[@]} -eq 1 && -f "${packages[0]}" ]]
+          [[ "$(sha512sum "${packages[0]}" | cut -d ' ' -f 1)" == "$DIGEST" ]]
+          [[ "$(git rev-parse HEAD)" == "$NEXT_COMPAT_SHA" ]]
+          export NEXT_WITH_TEXT_TARBALL="$PWD/${packages[0]}"
+          mkdir -p receipts
+          modes=(plain adapter)
+          pids=()
+          for mode in "${modes[@]}"; do
+            NEXT_COMPAT_MODE="$mode" \
+              NEXT_COMPAT_RECEIPT="receipts/$NEXT_COMPAT_VERSION-$NEXT_COMPAT_BUNDLER-$mode.json" \
+              bun test tests/compatibility.test.ts > "$RUNNER_TEMP/compatibility-$mode.log" 2>&1 &
+            pids+=("$!")
+          done
+          failed=0
+          for index in "${!modes[@]}"; do
+            wait "${pids[$index]}" || failed=1
+            mode="${modes[$index]}"
+            echo "::group::$NEXT_COMPAT_VERSION / $NEXT_COMPAT_BUNDLER / $mode"
+            cat "$RUNNER_TEMP/compatibility-$mode.log"
+            echo "::endgroup::"
+          done
+          exit "$failed"
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: compatibility-receipts-${{ matrix.next }}-${{ matrix.bundler }}
+          path: receipts/*.json
+          if-no-files-found: error
+
+  gate:
+    if: always()
+    needs: [prepare, cases]
+    runs-on: ubuntu-latest
+    steps:
+      - if: needs.prepare.result == 'success'
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - if: needs.prepare.result == 'success'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - if: needs.prepare.result == 'success'
+        uses: actions/download-artifact@v8
+        with:
+          name: compatibility-plan
+      - if: needs.prepare.result == 'success'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: compatibility-receipts-*
+          path: receipts
+      - name: Verify coverage and tarball identity
+        env:
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          CASE_RESULT: ${{ needs.cases.result }}
+        run: |
+          [[ "$PREPARE_RESULT" == success ]]
+          bun tests/compatibility-report.ts verify plan.json receipts
+          [[ "$CASE_RESULT" == success ]]

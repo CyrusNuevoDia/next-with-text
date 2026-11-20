@@ -488,6 +488,15 @@ export function publishedBody(
 // Route → absolute path of the HTML the build prerendered for it.
 export type PrerenderedHTML = Record<string, string>
 
+export function stripBasePath(pathname: string, basePath: string): string {
+  if (basePath && pathname === basePath) {
+    return "/"
+  }
+  return basePath && pathname.startsWith(`${basePath}/`)
+    ? pathname.slice(basePath.length)
+    : pathname
+}
+
 type AdapterOutputs = {
   appPages: Array<{ id: string }>
   prerenders: Array<{
@@ -521,10 +530,7 @@ export function adapterPrerenders(
       continue
     }
     // the adapter prefixes every pathname with basePath; routes are unprefixed
-    const route =
-      basePath && output.pathname.startsWith(basePath)
-        ? output.pathname.slice(basePath.length) || "/"
-        : output.pathname
+    const route = stripBasePath(output.pathname, basePath)
     if (route.includes("[") || route.split("/").some(isPrivateSegment)) {
       continue
     }

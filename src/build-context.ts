@@ -1,13 +1,30 @@
 import { existsSync, readFileSync } from "node:fs"
-import { isAbsolute, join, relative } from "node:path"
+import { createRequire } from "node:module"
+import { dirname, isAbsolute, join, relative } from "node:path"
 import type { NextConfig } from "next"
 import {
   adapterPrerenders,
   type PrerenderedHTML,
   type ResolvedOptions,
+  stripBasePath,
 } from "./shared.js"
 
 export type AdapterField = "stable" | "experimental"
+
+export function nextBuildProject(): string | undefined {
+  const entry = require.main?.filename
+  if (!entry?.endsWith(join("next", "dist", "bin", "next"))) {
+    return
+  }
+  // The CLI sets this on its own Next instance before loading next.config.
+  // A workspace can launch an app with a different Next peer from its parent.
+  const path = join(dirname(entry), "../build/build-context.js")
+  const build = require.cache[path]?.exports as
+    | { NextBuildContext?: { dir?: unknown } }
+    | undefined
+  const dir = build?.NextBuildContext?.dir
+  return typeof dir === "string" && isAbsolute(dir) ? dir : undefined
+}
 
 const NEXT_VERSION = /^16\.(\d+)\.\d+(?:-.+)?$/
 
@@ -107,7 +124,9 @@ export function buildContext(input: unknown): BuildContext {
   // canonical route independently of that extra pathname and of disk layout.
   const pages = canonicalPages(
     appPages.filter(
-      (page) => page.pathname === normalizeAppPath(page.sourcePage)
+      (page) =>
+        stripBasePath(page.pathname, basePath) ===
+        normalizeAppPath(page.sourcePage)
     )
   )
   return {
@@ -143,6 +162,10 @@ export function legacyBuildContext(
   projectDir: string,
   distDir: string
 ): BuildContext {
+  const requireFromApp = createRequire(join(projectDir, "package.json"))
+  const { normalizePagePath } = requireFromApp(
+    "next/dist/shared/lib/page-path/normalize-page-path"
+  ) as typeof import("next/dist/shared/lib/page-path/normalize-page-path")
   const read = (rel: string) =>
     JSON.parse(readFileSync(join(distDir, rel), "utf8")) as unknown
   const server = join(distDir, "server")
@@ -172,7 +195,7 @@ export function legacyBuildContext(
     ) {
       continue
     }
-    const base = join(server, "app", route === "/" ? "index" : route.slice(1))
+    const base = join(server, "app", normalizePagePath(route))
     // App Router HTML lives here; Pages Router prerenders live elsewhere. A
     // postponed shell is not the page's content.
     if (!existsSync(`${base}.html`) || postponed(`${base}.meta`)) {

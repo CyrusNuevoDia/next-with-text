@@ -5,6 +5,7 @@ import {
   adapterField,
   type BuildPayload,
   legacyBuildContext,
+  nextBuildProject,
   registerAdapter,
 } from "./build-context.js"
 import {
@@ -82,7 +83,7 @@ export function withText(
       return base
     }
 
-    const dir = process.cwd()
+    const dir = (phase === PHASE_BUILD && nextBuildProject()) || process.cwd()
     const distDir = resolve(dir, base.distDir ?? ".next")
     const appRoutes = userAppRoutes(dir)
     if (phase === PHASE_DEV) {

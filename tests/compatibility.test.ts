@@ -1,6 +1,6 @@
 // Opt in after `bun run build`:
 // NEXT_COMPAT_VERSION=16.0.0 NEXT_COMPAT_BUNDLER=webpack bun test tests/compatibility.test.ts
-// CI covers 16.0.0, 16.1.0, 16.2.0, 16.3.7, 16.3.8, 16.4.4 with both bundlers.
+// CI selects exact stable Next 16 releases and tests both bundlers and build modes.
 // NEXT_WITH_TEXT_TARBALL may select the exact artifact already tested for packaging.
 import { expect, test } from "bun:test"
 import {
@@ -8,8 +8,10 @@ import {
   cpSync,
   existsSync,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs"
@@ -17,12 +19,26 @@ import { createServer } from "node:net"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { sleep, spawn } from "bun"
+import {
+  digestOf,
+  isReviewedSecurityStop,
+  type Receipt,
+  SECURITY_ADVISORY,
+} from "./compatibility-report.js"
 
 const ROOT = join(import.meta.dir, "..")
 const VERSION = process.env.NEXT_COMPAT_VERSION
 const BUNDLER = process.env.NEXT_COMPAT_BUNDLER
-const ENABLED = VERSION !== undefined || BUNDLER !== undefined
-const DIST_DIR = ".compat-next"
+const RECEIPT_PATH = process.env.NEXT_COMPAT_RECEIPT
+const ENABLED =
+  VERSION !== undefined || BUNDLER !== undefined || RECEIPT_PATH !== undefined
+const MODE = process.env.NEXT_COMPAT_MODE ?? "plain"
+const FROM_PARENT = process.env.NEXT_COMPAT_FROM_PARENT === "1"
+const BASE_PATH = process.env.NEXT_COMPAT_BASE_PATH === "1"
+// Webpack's own prerenderer fails on this route before generation runs.
+const INDEX_REGRESSION =
+  VERSION === "16.4.6" && BUNDLER === "turbopack" && MODE === "plain"
+const DIST_DIR = MODE === "adapter" ? ".compat-next-final" : ".compat-next"
 const EXACT_NEXT_VERSION = /^16\.\d+\.\d+$/
 
 type Command = {
@@ -105,6 +121,46 @@ async function run(args: string[], cwd: string, timeout = 30_000) {
   }
 }
 
+async function plainSecurityControl(
+  next: string,
+  root: string,
+  version: string,
+  bundler: string
+) {
+  // Use the exact installed Next binary and a separate app with no wrapper.
+  const control = join(root, "plain-control")
+  mkdirSync(join(control, "app"), { recursive: true })
+  writeFileSync(
+    join(control, "package.json"),
+    JSON.stringify({
+      dependencies: { next: version },
+      name: "plain-next-control",
+      private: true,
+    })
+  )
+  writeFileSync(
+    join(control, "next.config.mjs"),
+    'export default { distDir: ".compat-next", experimental: { cpus: 2 } }\n'
+  )
+  writeFileSync(
+    join(control, "app", "layout.jsx"),
+    "export default function Layout({ children }) { return <html><body>{children}</body></html> }\n"
+  )
+  writeFileSync(
+    join(control, "app", "page.jsx"),
+    "export default function Page() { return <main>Plain Next control</main> }\n"
+  )
+  const result = command([next, "build", `--${bundler}`], control, 240_000)
+  try {
+    return (
+      (await result.exited) !== 0 &&
+      isReviewedSecurityStop(version, result.logs())
+    )
+  } finally {
+    await result.stop()
+  }
+}
+
 async function freePort(): Promise<number> {
   const server = createServer()
   await new Promise<void>((resolvePort, reject) => {
@@ -145,13 +201,25 @@ async function ready(server: Command, URL: string) {
 }
 
 test.skipIf(!ENABLED)(
-  `packed Next ${VERSION} / ${BUNDLER}: custom distDir and public/private surfaces`,
+  `packed Next ${VERSION} / ${BUNDLER} / ${MODE}: custom distDir and public/private surfaces`,
   async () => {
     if (!(VERSION && EXACT_NEXT_VERSION.test(VERSION))) {
       throw new Error("NEXT_COMPAT_VERSION must be an exact Next 16 version")
     }
     if (BUNDLER !== "webpack" && BUNDLER !== "turbopack") {
       throw new Error("NEXT_COMPAT_BUNDLER must be webpack or turbopack")
+    }
+    if (MODE !== "plain" && MODE !== "adapter") {
+      throw new Error("NEXT_COMPAT_MODE must be plain or adapter")
+    }
+    const sha = process.env.NEXT_COMPAT_SHA
+    if (
+      RECEIPT_PATH &&
+      (!(sha && process.env.NEXT_WITH_TEXT_TARBALL) || BASE_PATH || FROM_PARENT)
+    ) {
+      throw new Error(
+        "A compatibility receipt requires an exact commit, tarball, and standard fixture"
+      )
     }
 
     const temp = mkdtempSync(join(tmpdir(), "next-with-text-compat-"))
@@ -161,6 +229,11 @@ test.skipIf(!ENABLED)(
       cpSync(join(ROOT, "tests", "fixtures", "compatibility"), consumer, {
         recursive: true,
       })
+      if (INDEX_REGRESSION) {
+        const pageDir = join(consumer, "app", "index", "extra")
+        mkdirSync(pageDir, { recursive: true })
+        cpSync(join(consumer, "index-page.tsx"), join(pageDir, "page.tsx"))
+      }
       let tarball = process.env.NEXT_WITH_TEXT_TARBALL
       if (tarball) {
         tarball = resolve(tarball)
@@ -173,6 +246,24 @@ test.skipIf(!ENABLED)(
       }
       if (!existsSync(tarball)) {
         throw new Error(`Packed package does not exist: ${tarball}`)
+      }
+      const record = (
+        outcome: Pick<Receipt, "status"> & { control?: "next-security-stop" }
+      ) => {
+        if (RECEIPT_PATH) {
+          writeFileSync(
+            RECEIPT_PATH,
+            JSON.stringify({
+              ...outcome,
+              bundler: BUNDLER,
+              digest: digestOf(tarball),
+              mode: MODE,
+              sha,
+              version: VERSION,
+            }),
+            { flag: "wx" }
+          )
+        }
       }
       const manifestPath = join(consumer, "package.json")
       const manifest = JSON.parse(readFileSync(manifestPath, "utf8"))
@@ -201,14 +292,55 @@ test.skipIf(!ENABLED)(
       expect(await run([next, "build", "--help"], consumer)).toContain(
         `--${BUNDLER}`
       )
-      await run([next, "build", `--${BUNDLER}`], consumer, 240_000)
+      if (FROM_PARENT) {
+        cpSync(join(consumer, "bunfig.toml"), join(temp, "bunfig.toml"))
+        writeFileSync(
+          join(temp, "package.json"),
+          JSON.stringify({
+            dependencies: { next: VERSION === "16.0.0" ? "16.4.6" : "16.0.0" },
+            private: true,
+          })
+        )
+        await run(["bun", "install", "--ignore-scripts"], temp, 180_000)
+        await run([next, "build", "consumer", `--${BUNDLER}`], temp, 240_000)
+        expect(existsSync(join(temp, DIST_DIR))).toBe(false)
+      } else {
+        try {
+          await run([next, "build", `--${BUNDLER}`], consumer, 240_000)
+        } catch (error) {
+          if (
+            RECEIPT_PATH &&
+            error instanceof Error &&
+            isReviewedSecurityStop(VERSION, error.message) &&
+            (await plainSecurityControl(next, consumer, VERSION, BUNDLER))
+          ) {
+            console.log(
+              `UPSTREAM BLOCKED: Next ${VERSION} ${BUNDLER}, reproduced on plain Next. ${SECURITY_ADVISORY}`
+            )
+            record({
+              control: "next-security-stop",
+              status: "upstream-blocked",
+            })
+            return
+          }
+          throw error
+        }
+      }
       expect(existsSync(join(consumer, DIST_DIR, "BUILD_ID"))).toBe(true)
       expect(existsSync(join(consumer, ".next"))).toBe(false)
+      if (MODE === "plain") {
+        const serverApp = join(consumer, DIST_DIR, "server", "app")
+        expect(existsSync(join(serverApp, "index.html"))).toBe(true)
+        expect(existsSync(join(serverApp, "index.rsc"))).toBe(true)
+      }
 
       const publicDir = join(consumer, "public")
       const markdown = (file: string) =>
         readFileSync(join(publicDir, file), "utf8")
       expect(markdown("index.md")).toContain("COMPAT_PUBLIC_HOME")
+      if (INDEX_REGRESSION) {
+        expect(markdown("index/extra.md")).toContain("COMPAT_NESTED_INDEX")
+      }
       expect(markdown("notes/alpha.md")).toContain("COMPAT_MD_NOTE_alpha")
       expect(markdown("llms.txt")).toContain("](/notes/alpha.md)")
       const full = markdown("llms-full.txt")
@@ -224,6 +356,27 @@ test.skipIf(!ENABLED)(
         "COMPAT_EXCLUDED_SECRET",
       ]) {
         expect(full).not.toContain(privateContent)
+      }
+
+      if (MODE === "adapter") {
+        const observations = readFileSync(
+          join(consumer, "adapter-observations.jsonl"),
+          "utf8"
+        )
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line))
+        expect(observations).toEqual([
+          {
+            distDir: realpathSync(join(consumer, DIST_DIR)),
+            htmlExists: true,
+            index: markdown("llms.txt"),
+            nextVersion: VERSION,
+          },
+        ])
+      }
+      if (BASE_PATH) {
+        return
       }
 
       const port = await freePort()
@@ -270,7 +423,7 @@ test.skipIf(!ENABLED)(
       expect(await (await get("/account.md")).text()).toContain(
         "COMPAT_ACCOUNT session=none"
       )
-      if (VERSION === "16.0.0" && BUNDLER === "webpack") {
+      if (VERSION === "16.0.0" && BUNDLER === "webpack" && MODE === "plain") {
         await server.stop()
         server = undefined
         appendFileSync(
@@ -286,10 +439,15 @@ test.skipIf(!ENABLED)(
           await invalid.stop()
         }
       }
+      record({ status: "pass" })
     } catch (error) {
       throw new Error(
-        // biome-ignore lint/suspicious/noUnnecessaryConditions: installation can fail before the server is assigned
-        `Next ${VERSION} / ${BUNDLER} compatibility failed\n${server?.logs() ?? ""}`,
+        [
+          `Next ${VERSION} / ${BUNDLER} / ${MODE} compatibility failed`,
+          server?.logs(),
+        ]
+          .filter(Boolean)
+          .join("\n"),
         { cause: error }
       )
     } finally {

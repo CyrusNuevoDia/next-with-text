@@ -28,7 +28,14 @@
       "default": "./dist/index.mjs"
     },
     "./route": {
-      "types": "./dist/route.d.ts",
+      "import": {
+        "types": "./dist/route.d.ts",
+        "default": "./dist/route.js"
+      },
+      "require": {
+        "types": "./dist/route.d.cts",
+        "default": "./dist/route.cjs"
+      },
       "default": "./dist/route.js"
     }
   },
@@ -36,21 +43,21 @@
     "dist"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts --target=node --format=cjs --outfile=dist/index.cjs --packages=external && bun build src/adapter.ts --target=node --format=cjs --outfile=dist/adapter.cjs --packages=external && bun build src/patch.ts --target=node --format=cjs --outfile=dist/patch.cjs --external=@xberg-io/html-to-markdown && bun build src/route.ts --target=node --format=esm --outfile=dist/route.js --external=@xberg-io/html-to-markdown && cp src/index.mjs dist/index.mjs && tsc -p tsconfig.build.json && mv dist/index.d.ts dist/index.d.cts",
+    "build": "rm -rf dist && bun build src/index.ts --target=node --format=cjs --outfile=dist/index.cjs --external=next-with-text --external=@xberg-io/html-to-markdown && bun build src/adapter.ts --target=node --format=cjs --outfile=dist/adapter.cjs --external=next-with-text --external=@xberg-io/html-to-markdown && bun build src/patch.ts --target=node --format=cjs --outfile=dist/patch.cjs --external=@xberg-io/html-to-markdown && bun build src/route.ts --target=node --format=esm --outfile=dist/route.js --external=@xberg-io/html-to-markdown && bun build src/route.ts --target=node --format=cjs --outfile=dist/route.cjs --external=@xberg-io/html-to-markdown && cp src/index.mjs dist/index.mjs && tsc -p tsconfig.build.json && mv dist/index.d.ts dist/index.d.cts && cp dist/route.d.ts dist/route.d.cts",
     "check": "ultracite check",
     "fix": "ultracite fix",
     "prepack": "bun run build",
     "test": "bun run build && tsc --noEmit && bun test"
   },
   "dependencies": {
-    "@xberg-io/html-to-markdown": "^3.10.6",
-    "multimatch": "^7.0.0"
+    "@xberg-io/html-to-markdown": "^3.10.6"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.6",
     "@changesets/cli": "^2.31.0",
     "@types/bun": "latest",
     "@types/node": "^24",
+    "multimatch": "^7.0.0",
     "next": "latest",
     "typescript": "^6.0.3",
     "ultracite": "7.10.1"
@@ -59,6 +66,9 @@
     "next": ">=16 <17"
   },
   "packageManager": "bun@1.4.0",
+  "engines": {
+    "node": ">=20.9.0"
+  },
   "publishConfig": {
     "access": "public"
   }
