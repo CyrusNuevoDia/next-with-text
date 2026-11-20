@@ -85,6 +85,7 @@ jobs:
       fail-fast: false
       matrix:
         next: ${{ fromJSON(needs.prepare.outputs.versions) }}
+        bundler: [webpack, turbopack]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -99,9 +100,10 @@ jobs:
         with:
           name: ${{ needs.prepare.outputs.archive }}
           path: candidate
-      - name: Build all four consumer cases
+      - name: Build both adapter modes in parallel
         env:
           NEXT_COMPAT_VERSION: ${{ matrix.next }}
+          NEXT_COMPAT_BUNDLER: ${{ matrix.bundler }}
           NEXT_COMPAT_SHA: ${{ needs.prepare.outputs.sha }}
           DIGEST: ${{ needs.prepare.outputs.digest }}
         run: |
@@ -111,19 +113,27 @@ jobs:
           [[ "$(git rev-parse HEAD)" == "$NEXT_COMPAT_SHA" ]]
           export NEXT_WITH_TEXT_TARBALL="$PWD/${packages[0]}"
           mkdir -p receipts
+          modes=(plain adapter)
+          pids=()
+          for mode in "${modes[@]}"; do
+            NEXT_COMPAT_MODE="$mode" \
+              NEXT_COMPAT_RECEIPT="receipts/$NEXT_COMPAT_VERSION-$NEXT_COMPAT_BUNDLER-$mode.json" \
+              bun test tests/compatibility.test.ts > "$RUNNER_TEMP/compatibility-$mode.log" 2>&1 &
+            pids+=("$!")
+          done
           failed=0
-          for bundler in webpack turbopack; do
-            for mode in plain adapter; do
-              NEXT_COMPAT_BUNDLER="$bundler" NEXT_COMPAT_MODE="$mode" \
-                NEXT_COMPAT_RECEIPT="receipts/$NEXT_COMPAT_VERSION-$bundler-$mode.json" \
-                bun test tests/compatibility.test.ts || failed=1
-            done
+          for index in "${!modes[@]}"; do
+            wait "${pids[$index]}" || failed=1
+            mode="${modes[$index]}"
+            echo "::group::$NEXT_COMPAT_VERSION / $NEXT_COMPAT_BUNDLER / $mode"
+            cat "$RUNNER_TEMP/compatibility-$mode.log"
+            echo "::endgroup::"
           done
           exit "$failed"
       - if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: compatibility-receipts-${{ matrix.next }}
+          name: compatibility-receipts-${{ matrix.next }}-${{ matrix.bundler }}
           path: receipts/*.json
           if-no-files-found: error
 
